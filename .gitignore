@@ -1,0 +1,12 @@
+# Local-only reference and development files
+学习助手原版.txt
+超星学习助手-基础版.user.js
+超星学习助手-基础版-使用说明.md
+超星字体解码与AI答题集成报告.md
+.test-harness/
+
+# Editor and OS files
+.vscode/
+Thumbs.db
+.DS_Store
+*.log
