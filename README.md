@@ -274,3 +274,47 @@ a.btnSubmit / button.btnSubmit / btnBlueSubmit
 - 如果没有找到，则向顶层页面发送 `confirm-submit` 消息。
 - 顶层页面点击 `#popok`。
 - 兼容 `#submitBackOk`、`.layui-layer-btn0`、对话框内的“提交/确定/确认”按钮。
+## 支持的域名
+
+脚本参考原版 OCS 的超星项目域名列表，并加入显式学习通子域名：
+
+```text
+*.chaoxing.com
+mooc1.chaoxing.com
+mooc1-1.chaoxing.com
+mooc1-2.chaoxing.com
+mooc-ans.chaoxing.com
+mooc2-ans.chaoxing.com
+i.chaoxing.com
+*.edu.cn
+*.org.cn
+*.xueyinonline.com
+*.hnsyu.net
+*.qutjxjy.cn
+*.ynny.cn
+*.hnvist.cn
+*.fjlecb.cn
+*.gdhkmooc.com
+*.cugbonline.cn
+*.zjelib.cn
+*.cqrspx.cn
+*.neauce.com
+*.zhihui-yun.com
+*.cqie.cn
+*.ccqmxx.com
+*.jxgmxy.com
+*.jnzyjsxy.cn
+*.smjyxy.cn
+*.sslibrary.com
+*.xuexi365.com
+```
+
+`*.edu.cn` 和 `*.org.cn` 是原版中较宽泛的规则。脚本增加了页面特征检测，只有检测到以下超星页面特征时才初始化：
+
+- `#dct1`、`#dct2`
+- `#prevNextFocusNext`
+- `#curCourseId`、`#curChapterId`
+- `.singleQuesId`
+- `iframe[src*="chaoxing.com"]`
+- `iframe[src*="/mooc-ans/"]`
+- 学习通常见页面路径，例如 `/mycourse`、`/knowledge/cards`、`/ananas/modules/video`

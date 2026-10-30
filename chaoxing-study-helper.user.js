@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手 · 完整版
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.4.2
+// @version      2.4.3
 // @description  超星学习通视频自动播放、加密题目解码与 OpenAI 兼容 API 辅助答题，支持防重复请求、跨 iframe 自动确认提交、视频完成后打开章节测验、测验完成后下一节、接口测试和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -11,6 +11,14 @@
 // @updateURL    https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js
 // @downloadURL  https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js
 // @match        *://*.chaoxing.com/*
+// @match        *://mooc1.chaoxing.com/*
+// @match        *://mooc1-1.chaoxing.com/*
+// @match        *://mooc1-2.chaoxing.com/*
+// @match        *://mooc-ans.chaoxing.com/*
+// @match        *://mooc2-ans.chaoxing.com/*
+// @match        *://i.chaoxing.com/*
+// @match        *://*.edu.cn/*
+// @match        *://*.org.cn/*
 // @match        *://*.xueyinonline.com/*
 // @match        *://*.hnsyu.net/*
 // @match        *://*.qutjxjy.cn/*
@@ -201,6 +209,36 @@
     }
   })();
 
+  const SUPPORTED_HOST_SUFFIXES = [
+    'chaoxing.com',
+    'xueyinonline.com',
+    'hnsyu.net',
+    'qutjxjy.cn',
+    'ynny.cn',
+    'hnvist.cn',
+    'fjlecb.cn',
+    'gdhkmooc.com',
+    'cugbonline.cn',
+    'zjelib.cn',
+    'cqrspx.cn',
+    'neauce.com',
+    'zhihui-yun.com',
+    'cqie.cn',
+    'ccqmxx.com',
+    'jxgmxy.com',
+    'jnzyjsxy.cn',
+    'smjyxy.cn',
+    'sslibrary.com',
+    'xuexi365.com'
+  ];
+  const SUPPORTED_PATH_PATTERN = /\/(mycourse|knowledge\/cards|mooc-ans\/|ananas\/modules\/(?:video|work|exam)|work\/dohomework|mooc2\/work\/dowork)/i;
+
+  function isSupportedSite() {
+    const host = location.hostname.toLowerCase();
+    if (SUPPORTED_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) return true;
+    if (SUPPORTED_PATH_PATTERN.test(`${location.pathname}${location.search}`)) return true;
+    return Boolean(document.querySelector('#dct1, #dct2, #prevNextFocusNext, #curCourseId, #curChapterId, .singleQuesId, iframe[src*="chaoxing.com"], iframe[src*="/mooc-ans/"]'));
+  }
   function makeId() {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   }
@@ -2229,6 +2267,7 @@
     window.addEventListener('message', onWindowMessage);
 
     const boot = () => {
+      if (!isSupportedSite()) return;
       scanMedia();
       ensurePanel();
 
