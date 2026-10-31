@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星学习助手 · 完整版
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.4.3
-// @description  超星学习通视频自动播放、加密题目解码与 OpenAI 兼容 API 辅助答题，支持防重复请求、跨 iframe 自动确认提交、视频完成后打开章节测验、测验完成后下一节、接口测试和模型列表。
+// @version      2.4.4
+// @description  超星学习通视频自动播放、加密题目解码与 OpenAI 兼容 API 辅助答题，支持多视频锁定、防重复请求、跨 iframe 自动确认提交、视频完成后打开章节测验、测验完成后下一节、接口测试和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
 // @homepageURL  https://github.com/naije-c/chaoxing-study-helper
@@ -312,21 +312,41 @@
 
   function isVisible(element) {
     if (!element || !element.isConnected) return false;
-    if (element.tagName === 'AUDIO') {
-      return getComputedStyle(element).display !== 'none';
-    }
+    const style = getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    if (element.tagName === 'AUDIO') return true;
     const rect = element.getBoundingClientRect();
     return rect.width >= 80 && rect.height >= 40;
   }
 
+  function mediaArea(element) {
+    const rect = element.getBoundingClientRect();
+    return Math.max(0, rect.width) * Math.max(0, rect.height);
+  }
+
   function pickMedia() {
     const list = Array.from(document.querySelectorAll('video,audio'))
-      .filter((element) => element.isConnected && isVisible(element));
-
-    return list.find((element) => !element.paused && !element.ended)
+      .filter((element) => element.isConnected && isVisible(element))
+      .sort((a, b) => mediaArea(b) - mediaArea(a));
+    const playing = list.filter((element) => !element.paused && !element.ended);
+    if (currentMedia && currentMedia.isConnected && isVisible(currentMedia)) {
+      if (!currentMedia.paused && !currentMedia.ended) return currentMedia;
+      if (playing.length) return playing[0];
+      return currentMedia;
+    }
+    return playing[0]
       || list.find((element) => element.readyState > 0)
       || list[0]
       || null;
+  }
+
+  function pauseOtherMedia(activeMedia) {
+    if (!settings.running) return;
+    for (const media of document.querySelectorAll('video,audio')) {
+      if (media !== activeMedia && media.isConnected && !media.paused) {
+        try { media.pause(); } catch { /* The player may own this element. */ }
+      }
+    }
   }
 
   function applyMediaSettings() {
@@ -443,8 +463,12 @@
 
     clearMediaTimers();
     if (mediaAbort) mediaAbort.abort();
+    if (settings.running && currentMedia && currentMedia !== media && !currentMedia.paused) {
+      try { currentMedia.pause(); } catch { /* The player may own this element. */ }
+    }
     mediaAbort = new AbortController();
     currentMedia = media;
+    pauseOtherMedia(media);
 
     const { signal } = mediaAbort;
 
@@ -486,6 +510,22 @@
 
   function scanMedia() {
     if (currentMedia && currentMedia.isConnected) {
+      const activeVisible = isVisible(currentMedia);
+      const alternatives = Array.from(document.querySelectorAll('video,audio'))
+        .filter((media) => media !== currentMedia && media.isConnected && isVisible(media))
+        .sort((a, b) => mediaArea(b) - mediaArea(a));
+      const alternatePlaying = alternatives.find((media) => !media.paused && !media.ended);
+
+      if (!activeVisible && alternatives.length) {
+        bindMedia(alternatePlaying || alternatives[0]);
+        return;
+      }
+      if (activeVisible && currentMedia.paused && !currentMedia.ended && alternatePlaying) {
+        bindMedia(alternatePlaying);
+        return;
+      }
+
+      pauseOtherMedia(currentMedia);
       applyMediaSettings();
       scanVideoCompletion();
       return;

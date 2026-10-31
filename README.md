@@ -318,3 +318,14 @@ i.chaoxing.com
 - `iframe[src*="chaoxing.com"]`
 - `iframe[src*="/mooc-ans/"]`
 - 学习通常见页面路径，例如 `/mycourse`、`/knowledge/cards`、`/ananas/modules/video`
+## 多视频处理
+
+同一页面出现多个视频时，完整版会：
+
+- 只控制一个当前可见视频。
+- 优先保留正在播放的视频。
+- 当前视频隐藏后，重新选择可见视频。
+- 切换到另一个视频前，先暂停旧视频。
+- 每次扫描时暂停其他正在播放的视频，避免两个播放器互相抢占。
+
+该逻辑只影响当前文档中的 `video`、`audio` 元素，不会主动修改其他页面。
