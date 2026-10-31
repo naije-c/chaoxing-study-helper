@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星学习助手 · 完整版
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.4.4
-// @description  超星学习通视频自动播放、加密题目解码与 OpenAI 兼容 API 辅助答题，支持多视频锁定、防重复请求、跨 iframe 自动确认提交、视频完成后打开章节测验、测验完成后下一节、接口测试和模型列表。
+// @version      2.4.5
+// @description  超星学习通视频自动播放、加密题目解码与 OpenAI 兼容 API 辅助答题，支持同页及跨 iframe 多视频锁定、防重复请求、跨 iframe 自动确认提交、视频完成后打开章节测验、测验完成后下一节、接口测试和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
 // @homepageURL  https://github.com/naije-c/chaoxing-study-helper
@@ -199,6 +199,9 @@
   let lastVideoCompletionSignature = '';
   let lastVideoAutoActionSignature = '';
   let videoAutoActionTimer = 0;
+  let mediaOwnerId = '';
+  let activeMediaOwnerId = '';
+  let activeMediaOwnerAt = 0;
   const seenCommands = new Set();
 
   const isTop = (() => {
@@ -243,11 +246,104 @@
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
+  const MEDIA_FRAME_ID = makeId();
+
+  function requestMediaOwnership() {
+    const message = {
+      kind: MESSAGE_KIND,
+      id: makeId(),
+      action: 'media-claim',
+      frameId: MEDIA_FRAME_ID,
+      origin: location.origin,
+      url: location.href
+    };
+    if (isTop) {
+      handleMediaClaimMessage(message);
+      return;
+    }
+    try {
+      window.top.postMessage(message, '*');
+    } catch {
+      // The top page may be navigating.
+    }
+  }
+
+  function handleMediaClaimMessage(data) {
+    if (!isTop || !data?.frameId) return;
+    const frameId = String(data.frameId);
+    const now = Date.now();
+    if (!activeMediaOwnerId || activeMediaOwnerId === frameId || now - activeMediaOwnerAt > 10000) {
+      activeMediaOwnerId = frameId;
+      activeMediaOwnerAt = now;
+    }
+    const ownerMessage = {
+      kind: MESSAGE_KIND,
+      id: makeId(),
+      action: 'media-owner',
+      ownerId: activeMediaOwnerId
+    };
+    applyMediaOwnership(activeMediaOwnerId);
+    sendToChildren(ownerMessage);
+  }
+
+  function applyMediaOwnership(ownerId) {
+    mediaOwnerId = ownerId || '';
+    if (!mediaOwnerId) return;
+    if (mediaOwnerId === MEDIA_FRAME_ID) {
+      pauseOtherMedia(currentMedia);
+      if (currentMedia && settings.running) tryPlay(true);
+      return;
+    }
+    if (currentMedia && currentMedia.isConnected && !currentMedia.paused) {
+      try { currentMedia.pause(); } catch { /* The player may own this element. */ }
+    }
+  }
+
+  function releaseMediaOwnership() {
+    if (!mediaOwnerId || mediaOwnerId !== MEDIA_FRAME_ID) return;
+    mediaOwnerId = '';
+    if (isTop) {
+      if (activeMediaOwnerId === MEDIA_FRAME_ID) {
+        activeMediaOwnerId = '';
+        activeMediaOwnerAt = 0;
+        sendToChildren({ kind: MESSAGE_KIND, id: makeId(), action: 'media-owner', ownerId: '' });
+      }
+      return;
+    }
+    try {
+      window.top.postMessage({
+        kind: MESSAGE_KIND,
+        id: makeId(),
+        action: 'media-release',
+        frameId: MEDIA_FRAME_ID
+      }, '*');
+    } catch {
+      // The top page may be navigating.
+    }
+  }
+
+  function maintainMediaOwnership() {
+    if (!settings.running) return;
+    if (isTop) {
+      if (activeMediaOwnerId && Date.now() - activeMediaOwnerAt > 10000) {
+        activeMediaOwnerId = '';
+        activeMediaOwnerAt = 0;
+        sendToChildren({ kind: MESSAGE_KIND, id: makeId(), action: 'media-owner', ownerId: '' });
+      } else if (activeMediaOwnerId === MEDIA_FRAME_ID) {
+        activeMediaOwnerAt = Date.now();
+      }
+      return;
+    }
+    if (mediaOwnerId === MEDIA_FRAME_ID && currentMedia && currentMedia.isConnected) {
+      requestMediaOwnership();
+    }
+  }
   function saveSettings(patch, options = {}) {
     const previous = settings;
     settings = normalizeSettings({ ...settings, ...patch });
     gmSet(SETTINGS_KEY, settings);
     lastSettings = { ...settings };
+    if (!settings.running) releaseMediaOwnership();
     if (!settings.running || !settings.autoNext) {
       clearTimeout(quizAutoNextTimer);
       quizAutoNextTimer = 0;
@@ -409,9 +505,15 @@
     }
   }
 
-  function tryPlay() {
+  function tryPlay(forceOwned = false) {
     if (!settings.running || !currentMedia || !currentMedia.isConnected) return;
     if (currentMedia.ended) return;
+
+    if (!forceOwned && mediaOwnerId !== MEDIA_FRAME_ID) {
+      if (!mediaOwnerId) requestMediaOwnership();
+      if (mediaOwnerId !== MEDIA_FRAME_ID) return;
+    }
+    if (mediaOwnerId !== MEDIA_FRAME_ID) return;
 
     const reason = manualInterventionReason();
     if (reason) {
@@ -473,6 +575,7 @@
     const { signal } = mediaAbort;
 
     media.addEventListener('play', () => {
+      if (settings.running && mediaOwnerId !== MEDIA_FRAME_ID) requestMediaOwnership();
       applyMediaSettings();
       reportStatus('playing');
     }, { signal });
@@ -490,6 +593,7 @@
     }, { signal });
 
     media.addEventListener('ended', () => {
+      releaseMediaOwnership();
       reportStatus('ended', { message: '视频播放完毕', autoNext: settings.autoNext });
       scanVideoCompletion();
     }, { signal });
@@ -527,6 +631,7 @@
 
       pauseOtherMedia(currentMedia);
       applyMediaSettings();
+      if (settings.running) tryPlay();
       scanVideoCompletion();
       return;
     }
@@ -643,6 +748,23 @@
     const data = event.data;
     if (!data || data.kind !== MESSAGE_KIND || !data.action) return;
 
+    if (data.action === 'media-claim') {
+      if (isTop) handleMediaClaimMessage(data);
+      return;
+    }
+    if (data.action === 'media-release') {
+      if (isTop && activeMediaOwnerId === data.frameId) {
+        activeMediaOwnerId = '';
+        activeMediaOwnerAt = 0;
+        sendToChildren({ kind: MESSAGE_KIND, id: makeId(), action: 'media-owner', ownerId: '' });
+      }
+      return;
+    }
+    if (data.action === 'media-owner') {
+      applyMediaOwnership(data.ownerId || '');
+      sendToChildren(data);
+      return;
+    }
     if (data.action === 'status') {
       if (isTop) handleStatus(data);
       return;
@@ -2305,6 +2427,7 @@
 
   function start() {
     window.addEventListener('message', onWindowMessage);
+    window.addEventListener('pagehide', releaseMediaOwnership);
 
     const boot = () => {
       if (!isSupportedSite()) return;
@@ -2313,6 +2436,7 @@
 
       scanTimer = window.setInterval(() => {
         refreshSettingsFromStorage();
+        maintainMediaOwnership();
         scanMedia();
         ensurePanel();
         if (isTop) {
