@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         超星学习助手 · 完整版
+// @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.4.5
-// @description  超星学习通视频自动播放、加密题目解码与 OpenAI 兼容 API 辅助答题，支持同页及跨 iframe 多视频锁定、防重复请求、跨 iframe 自动确认提交、视频完成后打开章节测验、测验完成后下一节、接口测试和模型列表。
+// @version      2.5.0
+// @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持多视频锁定、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
 // @homepageURL  https://github.com/naije-c/chaoxing-study-helper
@@ -38,6 +38,7 @@
 // @match        *://*.smjyxy.cn/*
 // @match        *://*.sslibrary.com/*
 // @match        *://*.xuexi365.com/*
+// @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
@@ -82,6 +83,7 @@
     rate: 1.5,
     autoNext: true,
     nextDelay: 3,
+    editorFallback: true,
     collapsed: false,
     panelX: null,
     panelY: null
@@ -93,6 +95,11 @@
   const gmSet = typeof GM_setValue === 'function'
     ? GM_setValue
     : () => {};
+  const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const copyHandlerCache = new WeakMap();
+  const uEditorSeen = new WeakSet();
+  let copyUnlockInstalled = false;
+  let uEditorPollTimer = 0;
 
   function normalizeSettings(raw) {
     const value = raw && typeof raw === 'object' ? raw : {};
@@ -106,6 +113,7 @@
       nextDelay: Number.isFinite(nextDelay)
         ? Math.min(15, Math.max(1, nextDelay))
         : DEFAULT_SETTINGS.nextDelay,
+      editorFallback: Boolean(value.editorFallback ?? DEFAULT_SETTINGS.editorFallback),
       collapsed: Boolean(value.collapsed ?? DEFAULT_SETTINGS.collapsed),
       panelX: Number.isFinite(Number(value.panelX)) ? Number(value.panelX) : null,
       panelY: Number.isFinite(Number(value.panelY)) ? Number(value.panelY) : null
@@ -248,6 +256,151 @@
 
   const MEDIA_FRAME_ID = makeId();
 
+  function pinCopyHandler(target, eventName) {
+    if (!target) return;
+    const current = target[eventName];
+    if (typeof current === 'function' && current.__cxCopyUnlockWrapper) return;
+    let state = copyHandlerCache.get(target);
+    if (!state) {
+      state = {};
+      copyHandlerCache.set(target, state);
+    }
+    const wrapper = function (event) {
+      if (event) {
+        event.stopPropagation?.();
+        try { event.returnValue = true; } catch { /* Some events are read-only. */ }
+      }
+      return true;
+    };
+    wrapper.__cxCopyUnlockWrapper = true;
+    state[eventName] = wrapper;
+    try { target[eventName] = wrapper; } catch { /* Some document properties are read-only. */ }
+  }
+
+  function enableCopy(elements) {
+    const events = ['onselectstart', 'oncopy', 'oncut', 'onpaste', 'onkeydown'];
+    for (const target of elements) {
+      for (const eventName of events) pinCopyHandler(target, eventName);
+    }
+  }
+
+  function insertCopyableStyle() {
+    if (document.getElementById('cx-study-helper-copy-style')) return;
+    const style = document.createElement('style');
+    style.id = 'cx-study-helper-copy-style';
+    style.textContent = `
+      html * {
+        -webkit-user-select: text !important;
+        -khtml-user-select: text !important;
+        -moz-user-select: text !important;
+        -ms-user-select: text !important;
+        user-select: text !important;
+      }
+    `;
+    (document.head || document.documentElement).append(style);
+  }
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, (ch) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    })[ch]);
+  }
+
+  function removeUEditorPasteGuards(ue) {
+    for (const name of ['editorPaste', 'myEditor_paste']) {
+      const handler = pageWindow[name];
+      if (typeof handler === 'function' && typeof ue.removeListener === 'function') {
+        try { ue.removeListener('beforepaste', handler); } catch { /* Listener was not registered. */ }
+      }
+    }
+  }
+
+  function showUEditorFallback(ue) {
+    if (!settings.editorFallback || !ue?.body || document.getElementById('cx-ue-editor-fallback')) return;
+    const currentText = ue.getContentTxt?.() || ue.textarea?.value || '';
+    const overlay = document.createElement('div');
+    overlay.id = 'cx-ue-editor-fallback';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.42);display:flex;align-items:center;justify-content:center;';
+    const dialog = document.createElement('div');
+    dialog.style.cssText = 'width:min(760px,calc(100vw - 40px));background:#fff;border-radius:12px;box-shadow:0 20px 60px rgba(15,23,42,.28);padding:18px;font:14px/1.5 "Microsoft YaHei",sans-serif;';
+    const title = document.createElement('div');
+    title.textContent = '编辑内容（可正常复制粘贴）';
+    title.style.cssText = 'font-size:16px;font-weight:700;color:#1f2937;margin-bottom:10px;';
+    const textarea = document.createElement('textarea');
+    textarea.value = currentText;
+    textarea.style.cssText = 'width:100%;height:320px;box-sizing:border-box;padding:12px;border:1px solid #cbd5e1;border-radius:8px;resize:vertical;font:14px/1.6 Consolas,"Microsoft YaHei",monospace;outline:none;';
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;justify-content:flex-end;gap:10px;margin-top:12px;';
+    const cancel = document.createElement('button');
+    cancel.textContent = '取消';
+    cancel.style.cssText = 'height:34px;padding:0 18px;border:1px solid #cbd5e1;background:#fff;border-radius:8px;cursor:pointer;';
+    const save = document.createElement('button');
+    save.textContent = '写回编辑器';
+    save.style.cssText = 'height:34px;padding:0 18px;border:0;background:#2f6fed;color:#fff;border-radius:8px;cursor:pointer;';
+    const close = () => overlay.remove();
+    cancel.onclick = close;
+    save.onclick = () => {
+      const html = textarea.value.split(/\r?\n/).map((line) => `<p>${escapeHtml(line) || '<br>'}</p>`).join('');
+      try {
+        if (typeof ue.setContent === 'function') ue.setContent(html);
+        else if (ue.textarea) ue.textarea.value = textarea.value;
+      } finally {
+        close();
+      }
+    };
+    actions.append(cancel, save);
+    dialog.append(title, textarea, actions);
+    overlay.append(dialog);
+    document.body.append(overlay);
+    window.setTimeout(() => textarea.focus(), 0);
+  }
+
+  function installUEditorUnlock(ue) {
+    if (!ue?.body || uEditorSeen.has(ue)) return;
+    uEditorSeen.add(ue);
+    removeUEditorPasteGuards(ue);
+    ue.body.addEventListener('paste', (event) => {
+      const text = event.clipboardData?.getData('text/plain') || '';
+      if (!text) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const html = text.split(/\r?\n/).map((line) => `<p>${escapeHtml(line) || '<br>'}</p>`).join('');
+      try {
+        if (typeof ue.execCommand === 'function') ue.execCommand('insertHtml', html);
+        else if (typeof ue.setContent === 'function') ue.setContent(`${ue.getContent?.() || ''}${html}`);
+      } catch {
+        showUEditorFallback(ue);
+      }
+    }, true);
+    ue.body.addEventListener('click', () => {
+      if (settings.editorFallback) showUEditorFallback(ue);
+    });
+  }
+
+  function pollUEditors() {
+    const UE = pageWindow.UE;
+    const instants = UE?.instants;
+    if (!instants) return;
+    const editors = Array.isArray(instants) ? instants : Object.values(instants);
+    for (const ue of editors) installUEditorUnlock(ue);
+  }
+
+  function installCopyUnlock() {
+    if (copyUnlockInstalled) return;
+    copyUnlockInstalled = true;
+    enableCopy([document, document.documentElement, document.body].filter(Boolean));
+    insertCopyableStyle();
+    window.setTimeout(() => {
+      enableCopy([document, document.documentElement, document.body].filter(Boolean));
+      insertCopyableStyle();
+    }, 3000);
+    pollUEditors();
+    uEditorPollTimer = window.setInterval(pollUEditors, 500);
+  }
   function requestMediaOwnership() {
     const message = {
       kind: MESSAGE_KIND,
@@ -1990,7 +2143,7 @@
           font: inherit;
         }
         select:focus, input[type="number"]:focus, input[type="text"]:focus, input[type="password"]:focus { border-color: #6594eb; box-shadow: 0 0 0 2px rgba(47, 111, 237, 0.12); }
-        .checks { display: flex; gap: 14px; }
+        .checks { display: flex; flex-wrap: wrap; gap: 8px 14px; }
         .check { display: inline-flex; align-items: center; gap: 5px; color: #43526a; user-select: none; }
         .check input { accent-color: #2f6fed; }
         .note {
@@ -2029,7 +2182,7 @@
       <div class="panel${settings.collapsed ? ' collapsed' : ''}">
         <div class="head">
           <span class="dot"></span>
-          <span class="title">超星学习助手 · 完整版</span>
+          <span class="title">超星学习助手</span>
           <button class="icon-btn" data-role="collapse" title="收起/展开">${settings.collapsed ? '+' : '−'}</button>
         </div>
         <div class="body">
@@ -2059,6 +2212,7 @@
             <div class="field full checks">
               <label class="check"><input data-role="muted" type="checkbox"> 静音播放</label>
               <label class="check"><input data-role="auto-next" type="checkbox"> 自动下一节</label>
+              <label class="check"><input data-role="editor-fallback" type="checkbox"> UEditor 弹窗编辑</label>
             </div>
           </div>
           <details class="ai-settings">
@@ -2106,6 +2260,7 @@
     const delayInput = shadow.querySelector('[data-role="delay"]');
     const mutedInput = shadow.querySelector('[data-role="muted"]');
     const autoNextInput = shadow.querySelector('[data-role="auto-next"]');
+    const editorFallbackInput = shadow.querySelector('[data-role="editor-fallback"]');
     const collapseButton = shadow.querySelector('[data-role="collapse"]');
     const aiRunButton = shadow.querySelector('[data-role="ai-run"]');
     const aiSaveButton = shadow.querySelector('[data-role="ai-save"]');
@@ -2127,6 +2282,7 @@
       delayInput,
       mutedInput,
       autoNextInput,
+      editorFallbackInput,
       collapseButton,
       aiRunButton,
       aiSaveButton,
@@ -2195,6 +2351,10 @@
 
     autoNextInput.addEventListener('change', () => {
       saveSettings({ autoNext: autoNextInput.checked });
+    });
+
+    editorFallbackInput.addEventListener('change', () => {
+      saveSettings({ editorFallback: editorFallbackInput.checked });
     });
 
     aiTestButton.addEventListener('click', async () => {
@@ -2314,6 +2474,7 @@
     panelUi.delayInput.value = String(settings.nextDelay);
     panelUi.mutedInput.checked = settings.muted;
     panelUi.autoNextInput.checked = settings.autoNext;
+    panelUi.editorFallbackInput.checked = settings.editorFallback;
   }
 
   function syncAiPanelFromSettings() {
@@ -2431,6 +2592,7 @@
 
     const boot = () => {
       if (!isSupportedSite()) return;
+      installCopyUnlock();
       scanMedia();
       ensurePanel();
 
