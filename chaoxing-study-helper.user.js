@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.5.0
+// @version      2.5.1
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持多视频锁定、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -80,7 +80,8 @@
   const DEFAULT_SETTINGS = Object.freeze({
     running: false,
     muted: true,
-    rate: 1.5,
+    rate: 1.0,
+    rateDefaultMigrated: false,
     autoNext: true,
     nextDelay: 3,
     editorFallback: true,
@@ -109,6 +110,7 @@
       running: Boolean(value.running ?? DEFAULT_SETTINGS.running),
       muted: Boolean(value.muted ?? DEFAULT_SETTINGS.muted),
       rate: [1, 1.25, 1.5, 1.75, 2].includes(rate) ? rate : DEFAULT_SETTINGS.rate,
+      rateDefaultMigrated: Boolean(value.rateDefaultMigrated ?? DEFAULT_SETTINGS.rateDefaultMigrated),
       autoNext: Boolean(value.autoNext ?? DEFAULT_SETTINGS.autoNext),
       nextDelay: Number.isFinite(nextDelay)
         ? Math.min(15, Math.max(1, nextDelay))
@@ -121,7 +123,14 @@
   }
 
   function readSettings() {
-    return normalizeSettings(gmGet(SETTINGS_KEY, DEFAULT_SETTINGS));
+    const raw = gmGet(SETTINGS_KEY, DEFAULT_SETTINGS);
+    const normalized = normalizeSettings(raw);
+    if (!normalized.rateDefaultMigrated) {
+      normalized.rate = 1.0;
+      normalized.rateDefaultMigrated = true;
+      gmSet(SETTINGS_KEY, normalized);
+    }
+    return normalized;
   }
 
   function normalizeAiSettings(raw) {
