@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.1
+// @version      2.6.2
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -67,6 +67,9 @@
   const CX_REF_CACHE_MAX = 3;
   const AI_RUN_CACHE_TTL = 30 * 60 * 1000;
   const AI_RUN_CACHE_MAX = 80;
+  // How long the multi-video coordinator waits for unreadable task-point states
+  // before assuming they are finished task points and moving on.
+  const VIDEO_TASK_WAIT_MS = 16000;
 
   const DEFAULT_AI_SETTINGS = Object.freeze({
     endpoint: '',
@@ -215,6 +218,9 @@
   let quizAutoNextTimer = 0;
   let lastVideoCompletionSignature = '';
   let lastVideoAutoActionSignature = '';
+  let completedTaskAutoNextSignature = '';
+  let completedTaskAutoNextAttempts = 0;
+  let completedTaskAutoNextDone = false;
   let videoAutoActionTimer = 0;
   let mediaOwnerId = '';
   let activeMediaOwnerId = '';
@@ -227,6 +233,8 @@
   let selectedVideoTaskKey = '';
   let lastVideoTaskFocusAt = 0;
   let multiVideoAdvanceSignature = '';
+  let videoTaskWaitSignature = '';
+  let videoTaskWaitStartedAt = 0;
   const seenCommands = new Set();
 
   const isTop = (() => {
@@ -619,10 +627,25 @@
     }
   }
 
+  // A frame nested inside another frame's document only sees data-jobid on its
+  // own element: the outer iframe is reachable through the window hierarchy,
+  // never through DOM ancestry. The walk therefore jumps to the host element of
+  // the parent document; otherwise a nested player would inherit the jobid of
+  // the task iframe that hosts it.
+  function hostFrameElementOf(doc) {
+    try {
+      const view = doc?.defaultView;
+      if (!view) return null;
+      return view.frameElement || null;
+    } catch {
+      return null;
+    }
+  }
+
   function parseFrameData(frame) {
     if (!frame) return {};
     let node = frame;
-    for (let depth = 0; node && depth < 9; depth++, node = node.parentElement) {
+    for (let depth = 0; node && depth < 9; depth++) {
       try {
         if (node.tagName === 'IFRAME') {
           const raw = node.getAttribute('data');
@@ -637,10 +660,11 @@
           const directJobId = node.getAttribute('data-jobid') || node.getAttribute('data-job-id');
           if (directJobId) return { jobid: directJobId };
         }
-        if (node === node.ownerDocument?.body || node === node.ownerDocument?.documentElement) break;
       } catch {
         break;
       }
+      const parentDoc = node.ownerDocument;
+      node = hostFrameElementOf(parentDoc);
     }
     try {
       const url = new URL(frame.getAttribute('src') || frame.src || '', location.href);
@@ -701,36 +725,134 @@
     return null;
   }
 
+  const TASK_COMPLETED_SELECTOR = '.icon_Completed, .task-point-completed, .taskPointCompleted, [data-completed="true"], [data-task-completed="true"]';
+  const TASK_UNCOMPLETED_SELECTOR = '.icon_Uncompleted, .icon_UnComplete, .icon_Unfinished, .task-point-uncompleted, .taskPointUncompleted, .taskPointUncomplete, [data-completed="false"], [data-task-completed="false"]';
+  const TASK_COMPLETED_TEXT = /任务点已完成|任务点.{0,20}已完成|已完成任务点/;
+  const TASK_UNCOMPLETED_TEXT = /任务点未完成|任务点待完成|待完成任务点|未完成任务点|任务点.{0,20}未完成/;
+
+  // innerText minus every iframe body, so one card's markers cannot leak into
+  // a neighbouring card or into the page body.
+  function readableTaskText(node) {
+    if (!node) return '';
+    let text = '';
+    try {
+      for (const child of node.childNodes) {
+        if (child.nodeType === 3) {
+          text += child.textContent || '';
+          continue;
+        }
+        if (child.nodeType !== 1) continue;
+        const tag = child.tagName;
+        if (tag === 'IFRAME' || tag === 'VIDEO' || tag === 'AUDIO' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') continue;
+        text += readableTaskText(child);
+        if (text.length > 800) break;
+      }
+    } catch {
+      // Detached or cross-origin nodes are simply skipped.
+    }
+    return text.replace(/\s+/g, '');
+  }
+
+  // Elements matching a selector inside one document only: querySelectorAll
+  // on an element also returns nodes of nested same-origin documents.
+  function selectorInDocument(root, selector) {
+    try {
+      return Array.from(root.querySelectorAll(selector))
+        .some((element) => element.ownerDocument === root.ownerDocument);
+    } catch {
+      return false;
+    }
+  }
+
+  function isTaskCandidateFrame(frame) {
+    if (!frame) return false;
+    try {
+      const src = String(frame.getAttribute('src') || frame.src || '');
+      if (!src || src === 'about:blank') return false;
+    } catch {
+      return false;
+    }
+    const data = parseFrameData(frame);
+    if (data.jobid || data._jobid) return true;
+    const src = String(frame.getAttribute('src') || frame.src || '');
+    // Chaoxing's own video task module.
+    if (/\/ananas\/modules\/video|modules\/video\/index\.html/i.test(src)) return true;
+    if (!/video/i.test(src)) return false;
+    // A bare "video" match is too broad: on single-video sections it also hits
+    // the player frame nested inside the video task iframe, which has no task
+    // point markup and would otherwise stay "unknown" forever.
+    if (frame.parentElement?.tagName === 'IFRAME') return false;
+    return Boolean(frame.getBoundingClientRect().height);
+  }
+
+  function outerTaskContainer(frame) {
+    let node = frame?.parentElement;
+    for (let depth = 0; node && depth < 14; depth++, node = node.parentElement) {
+      try {
+        if (node === frame.ownerDocument?.body || node === frame.ownerDocument?.documentElement) return null;
+        const text = readableTaskText(node);
+        if (selectorInDocument(node, TASK_COMPLETED_SELECTOR)
+          || selectorInDocument(node, TASK_UNCOMPLETED_SELECTOR)
+          || /任务点|已完成|未完成|待完成/.test(text)) {
+          return node;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  // When the per-video container carries no marker (common on multi-video
+  // chapters where all videos sit in one responsive card) the chapter card is
+  // the only place that still shows "任务点已完成".
+  function taskContainerWithOtherVideoFrames(frame) {
+    let node = outerTaskContainer(frame);
+    for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+      try {
+        if (node === frame.ownerDocument?.body || node === frame.ownerDocument?.documentElement) return null;
+        const others = Array.from(node.querySelectorAll('iframe'))
+          .filter((candidate) => candidate !== frame && isTaskCandidateFrame(candidate)).length;
+        if (others > 0) return node;
+        node = node.parentElement;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  function taskStateFromContainer(container) {
+    if (!container) return null;
+    const text = readableTaskText(container);
+    if (selectorInDocument(container, TASK_COMPLETED_SELECTOR) || TASK_COMPLETED_TEXT.test(text)) {
+      return { known: true, completed: true, taskPoint: true, label: '' };
+    }
+    if (selectorInDocument(container, TASK_UNCOMPLETED_SELECTOR) || TASK_UNCOMPLETED_TEXT.test(text)) {
+      return { known: true, completed: false, taskPoint: true, label: '' };
+    }
+    return null;
+  }
+
   function readTaskStateFromFrameElement(frame) {
     if (!frame) return { known: false, completed: false, taskPoint: false };
     const attachmentState = readAttachmentTaskState(frame);
     if (attachmentState) return attachmentState;
 
-    let node = frame.parentElement;
-    for (let depth = 0; node && depth < 14; depth++, node = node.parentElement) {
-      try {
-        if (node === frame.ownerDocument?.body || node === frame.ownerDocument?.documentElement) break;
-        const videoFrames = node.querySelectorAll?.(
-          'iframe[src*="/ananas/modules/video"], iframe[src*="modules/video/index.html"]'
-        ).length || 0;
-        if (videoFrames > 1) break;
+    const ownContainer = outerTaskContainer(frame);
+    const own = taskStateFromContainer(ownContainer);
+    if (own) return own;
 
-        const text = String(node.innerText || '').replace(/\s+/g, '');
-        const completed = Boolean(node.querySelector?.(
-          '.icon_Completed, .task-point-completed, .taskPointCompleted, [data-completed="true"], [data-task-completed="true"]'
-        )) || /任务点已完成/.test(text) || /任务点.{0,20}已完成/.test(text);
-        if (completed) return { known: true, completed: true, taskPoint: true, label: '' };
+    const shared = taskContainerWithOtherVideoFrames(frame);
+    if (shared) {
+      const sharedState = taskStateFromContainer(shared);
+      if (sharedState) return sharedState;
+    }
 
-        const uncompleted = Boolean(node.querySelector?.(
-          '.icon_Uncompleted, .icon_UnComplete, .icon_Unfinished, .task-point-uncompleted, .taskPointUncompleted, .taskPointUncomplete, [data-completed="false"], [data-task-completed="false"]'
-        )) || /任务点未完成|任务点待完成|待完成任务点/.test(text);
-        if (uncompleted) return { known: true, completed: false, taskPoint: true, label: '' };
-        if (/任务点/.test(text) && text.length < 500) {
-          return { known: true, completed: false, taskPoint: true, label: '' };
-        }
-      } catch {
-        break;
-      }
+    // Last resort: a task point that is visibly "任务点" but carries no state
+    // marker is treated as pending, which keeps playback conservative.
+    if (ownContainer && /任务点/.test(readableTaskText(ownContainer))) {
+      return { known: true, completed: false, taskPoint: true, label: '' };
     }
     return { known: false, completed: false, taskPoint: false };
   }
@@ -781,14 +903,13 @@
       if (!root || seenDocs.has(root) || depth > 7) return;
       seenDocs.add(root);
       for (const frame of Array.from(root.querySelectorAll('iframe'))) {
-        const src = String(frame.getAttribute('src') || frame.src || '');
         let hasInlineMedia = false;
         try {
           hasInlineMedia = Boolean(frame.contentDocument?.querySelector('video,audio'));
         } catch {
           // Cross-origin child frame.
         }
-        if (/\/ananas\/modules\/video|modules\/video\/index\.html|video/i.test(src) || hasInlineMedia) {
+        if (hasInlineMedia || isTaskCandidateFrame(frame)) {
           result.push(frame);
         }
         try {
@@ -817,14 +938,28 @@
     return null;
   }
 
+  // End-of-video is the strongest completion signal: the player only reaches it
+  // after the task point has been studied, so it may override a stale marker.
+  function mediaFinishedInFrame(frame) {
+    if (!frame) return false;
+    try {
+      const media = mediaInDocument(frame.contentDocument);
+      if (!media) return false;
+      if (media.ended) return true;
+      const duration = Number(media.duration);
+      const current = Number(media.currentTime);
+      return Number.isFinite(duration) && duration > 0 && Number.isFinite(current) && current / duration >= 0.995;
+    } catch {
+      // Cross-origin child frame.
+      return false;
+    }
+  }
+
   function getVideoTaskStates(doc = document) {
     return videoTaskFrames(doc).map((frame, index) => {
       let state = readTaskStateFromFrameElement(frame);
-      try {
-        const media = mediaInDocument(frame.contentDocument);
-        if (media?.ended) state = { known: true, completed: true, taskPoint: true, label: state.label || '' };
-      } catch {
-        // Cross-origin child frame.
+      if (mediaFinishedInFrame(frame)) {
+        state = { known: true, completed: true, taskPoint: true, label: state.label || '' };
       }
       return { frame, state, index, key: getFrameTaskKey(frame, index) };
     });
@@ -2303,9 +2438,11 @@
 
   function scheduleMultiVideoAdvance(states) {
     if (!settings.autoNext || videoAutoActionTimer) return;
-    const signature = `${location.pathname}|${location.search}|${states.map((item) => `${item.key}:${item.state.completed}`).join('|')}`;
+    const signature = `${location.pathname}|${location.search}|${currentChapterMarker()}|${states.map((item) => `${item.key}:${item.state.known ? 1 : 0}:${item.state.completed ? 1 : 0}`).join('|')}`;
     if (signature === multiVideoAdvanceSignature) return;
     multiVideoAdvanceSignature = signature;
+    videoTaskWaitSignature = '';
+    videoTaskWaitStartedAt = 0;
     const delay = Math.max(1, Number(settings.nextDelay) || 3);
     reportStatus('video-complete', {
       message: `本页视频任务点均已完成，${delay} 秒后检查章节测验或下一节…`
@@ -2313,7 +2450,32 @@
     videoAutoActionTimer = window.setTimeout(() => {
       videoAutoActionTimer = 0;
       probeMultiVideoTasks(0);
-    }, delay * 1000);
+    }, delay * 1000) || 1;
+  }
+
+  // Unknown task-point states must never block the chapter transition forever.
+  // Once every readable task point is finished, give the page one grace period
+  // and then move on (the task list stays manually reviewable).
+  function scheduleUnknownTaskWait(unknownCount) {
+    // Use a primitive timer id: browsers may hand out objects here.
+    const now = Number(Date.now());
+    const signature = `${location.pathname}|${location.search}|${unknownCount}`;
+    if (signature !== videoTaskWaitSignature) {
+      videoTaskWaitSignature = signature;
+      videoTaskWaitStartedAt = now;
+    }
+    const waited = Math.max(0, now - Number(videoTaskWaitStartedAt || now));
+    if (waited >= VIDEO_TASK_WAIT_MS) return false;
+    reportStatus('video-task-waiting', {
+      message: `还有 ${unknownCount} 个视频任务点暂未读到完成状态，正在确认（最多 ${Math.round(VIDEO_TASK_WAIT_MS / 1000)} 秒）…如确认无未完成任务，将按已完成继续跳转。`
+    });
+    const remaining = VIDEO_TASK_WAIT_MS - waited;
+    const retryDelay = Math.min(2000, Math.max(1000, remaining));
+    videoAutoActionTimer = window.setTimeout(() => {
+      videoAutoActionTimer = 0;
+      coordinateVideoTasks();
+    }, retryDelay) || 1;
+    return true;
   }
 
   // The top frame is the single source of truth for which video task may play.
@@ -2333,6 +2495,8 @@
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     const selectedPending = pending.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
     if (selectedPending) {
+      videoTaskWaitSignature = '';
+      videoTaskWaitStartedAt = 0;
       // Re-send periodically in case the selected player iframe loaded after the
       // first grant or the page replaced its inner document.
       if (Date.now() - lastVideoTaskFocusAt > 4000) {
@@ -2344,6 +2508,8 @@
     }
 
     if (pending.length > 0) {
+      videoTaskWaitSignature = '';
+      videoTaskWaitStartedAt = 0;
       focusVideoTask(pending[0]);
       return;
     }
@@ -2351,10 +2517,12 @@
     const unknown = states.filter((item) => !item.state.known);
     if (unknown.length > 0) {
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
-      reportStatus('video-task-waiting', {
-        message: `还有 ${unknown.length} 个视频任务点暂时无法判断是否完成，暂不自动播放，避免重播已完成视频。`
-      });
-      return;
+      // A still-playing video is an unfinished task point; do not skip it.
+      if (Array.from(document.querySelectorAll('video,audio')).some((media) => media.isConnected && !media.paused && !media.ended)) {
+        reportStatus('video-task-waiting', { message: '检测到视频仍在播放，等待其结束后再继续。' });
+        return;
+      }
+      if (scheduleUnknownTaskWait(unknown.length)) return;
     }
 
     resetVideoTaskFocus();
@@ -2363,7 +2531,8 @@
 
   function probeMultiVideoTasks(attempt = 0) {
     videoAutoActionTimer = 0;
-    if (!settings.running) return;
+    if (!settings.running || !isTop) return;
+    if (!isMultiVideoTaskPage()) return;
     const states = getVideoTaskStates(document);
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     if (pending.length > 0) {
@@ -2372,19 +2541,20 @@
     }
 
     const unknown = states.filter((item) => !item.state.known);
-    if (unknown.length > 0 && attempt < 3) {
+    if (unknown.length > 0 && attempt < 6) {
       reportStatus('video-complete', { message: '正在确认剩余视频任务点的完成状态…' });
       videoAutoActionTimer = window.setTimeout(() => probeMultiVideoTasks(attempt + 1), 1500);
       return;
     }
     if (unknown.length > 0) {
-      reportStatus('no-next', { message: '仍有视频任务点无法判断完成状态，请手动检查任务列表。' });
-      return;
-    }
-    if (!settings.autoNext) {
+      reportStatus('video-complete', {
+        message: `本页可识别的视频任务点均已完成，${unknown.length} 个任务点未读到状态，按已完成继续跳转（请留意任务列表）。`
+      });
+    } else if (!settings.autoNext) {
       reportStatus('video-complete', { message: '本页视频任务点均已完成。' });
       return;
     }
+    if (!settings.autoNext) return;
     continueAfterVideoTasks();
   }
 
@@ -2399,10 +2569,10 @@
     lastVideoAutoActionSignature = payload.signature;
     const delay = Math.max(1, Number(settings.nextDelay) || 3);
     if (isMultiVideoTaskPage()) {
-      reportStatus('video-complete', { message: `当前视频已完成，${delay} 秒后选择下一个未完成任务点…` });
+      reportStatus('video-complete', { message: `当前视频已完成，${delay} 秒后选择下一个任务点或跳转章节…` });
       videoAutoActionTimer = window.setTimeout(() => {
         videoAutoActionTimer = 0;
-        probeMultiVideoTasks(0);
+        coordinateVideoTasks();
       }, delay * 1000);
       return;
     }
@@ -2420,10 +2590,83 @@
       continueAfterVideoTasks();
     }, delay * 1000);
   }
+  // Chaoxing may swap chapters inside the same document, so the URL alone does
+  // not identify the current section for de-duplication purposes.
+  function currentChapterMarker() {
+    try {
+      const field = document.querySelector('#curChapterId');
+      const value = field?.value || field?.textContent || '';
+      if (String(value).trim()) return String(value).trim();
+    } catch {
+      // Ignore unreadable hidden fields.
+    }
+    try {
+      const url = new URL(location.href);
+      return url.searchParams.get('chapterId') || url.searchParams.get('knowledgeid') || '';
+    } catch {
+      return '';
+    }
+  }
+
+  // A single-video section can already be finished when the page loads (the
+  // learner watched it in an earlier session). No "ended" event will ever fire
+  // then, so the task-point marker itself has to drive the chapter jump.
+  function handleAlreadyCompletedVideoTask() {
+    if (!isTop || !settings.running || !settings.autoNext) return;
+    if (videoAutoActionTimer) return;
+    if (isMultiVideoTaskPage()) return;
+
+    const frames = videoTaskFrames(document);
+    if (frames.length !== 1) return;
+
+    const states = getVideoTaskStates(document);
+    const state = states[0]?.state;
+    if (!state || !state.known || !state.completed) return;
+
+    const signature = `${location.pathname}|${location.search}|${currentChapterMarker()}|${states[0].key}|${state.label || ''}`;
+    if (signature !== completedTaskAutoNextSignature) {
+      completedTaskAutoNextSignature = signature;
+      completedTaskAutoNextAttempts = 0;
+      completedTaskAutoNextDone = false;
+    }
+    if (completedTaskAutoNextDone) return;
+    // The navigation may be refused once (e.g. while the tab is still loading);
+    // retry on later scan ticks instead of reporting a dead end.
+    if (completedTaskAutoNextAttempts >= 3) {
+      completedTaskAutoNextDone = true;
+      reportStatus('no-next', { message: '任务点已完成，但自动切换未生效，请手动点击“下一节”。' });
+      return;
+    }
+
+    const testTab = findChapterTestTab();
+    if (testTab && testTab.classList.contains('active')) return;
+
+    const delay = Math.max(1, Number(settings.nextDelay) || 3);
+    completedTaskAutoNextAttempts += 1;
+    reportStatus('video-complete', {
+      message: testTab
+        ? `检测到任务点已完成，${delay} 秒后打开章节测验…`
+        : `检测到任务点已完成，${delay} 秒后进入下一节…`
+    });
+    videoAutoActionTimer = window.setTimeout(() => {
+      videoAutoActionTimer = 0;
+      continueAfterVideoTasks();
+      // If the page did not change, the next ticks stop at attempts >= 3; mark
+      // the task as handled so the same page cannot trigger a jump storm.
+      completedTaskAutoNextDone = true;
+    }, delay * 1000) || 1;
+  }
   function scanVideoCompletion() {
     if (!settings.running || !settings.autoNext) {
       lastVideoCompletionSignature = '';
       return;
+    }
+    if (isTop) {
+      try {
+        handleAlreadyCompletedVideoTask();
+      } catch {
+        // Never let a marker lookup break the media scan.
+      }
     }
     if (!currentMedia || !isMediaComplete(currentMedia)) return;
     const signature = `${location.pathname}|${location.search}|${currentMedia.currentSrc || ''}`;
