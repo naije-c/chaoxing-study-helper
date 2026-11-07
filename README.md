@@ -2,7 +2,7 @@
 
 面向超星学习通的 Tampermonkey 用户脚本，提供视频播放、复制粘贴限制解除、章节测验辅助和自动任务跳转等基础功能。
 
-![Version](https://img.shields.io/badge/version-2.5.1-blue)
+![Version](https://img.shields.io/badge/version-2.6.0-blue)
 ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-compatible-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -17,7 +17,9 @@
 - 静音与 1.0～2.0 倍速
 - 视频完成后打开章节测验
 - 章节测验完成后进入下一节
-- 同页面及跨 iframe 多视频播放锁
+- 识别同一页面内的多个视频任务点，自动跳过已完成项
+- 只向第一个未完成任务点授予播放权，完成后自动选择下一个
+- 同页面及跨 iframe 播放互斥，避免多个视频来回切换
 - 可拖动、可收起的悬浮面板
 
 ### 复制粘贴辅助
