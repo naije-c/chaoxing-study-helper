@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.0
+// @version      2.6.1
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -225,6 +225,7 @@
   let taskFocusGranted = false;
   let selectedVideoTaskFrame = null;
   let selectedVideoTaskKey = '';
+  let lastVideoTaskFocusAt = 0;
   let multiVideoAdvanceSignature = '';
   const seenCommands = new Set();
 
@@ -781,7 +782,15 @@
       seenDocs.add(root);
       for (const frame of Array.from(root.querySelectorAll('iframe'))) {
         const src = String(frame.getAttribute('src') || frame.src || '');
-        if (/\/ananas\/modules\/video|modules\/video\/index\.html/i.test(src)) result.push(frame);
+        let hasInlineMedia = false;
+        try {
+          hasInlineMedia = Boolean(frame.contentDocument?.querySelector('video,audio'));
+        } catch {
+          // Cross-origin child frame.
+        }
+        if (/\/ananas\/modules\/video|modules\/video\/index\.html|video/i.test(src) || hasInlineMedia) {
+          result.push(frame);
+        }
         try {
           if (frame.contentDocument) walk(frame.contentDocument, depth + 1);
         } catch {
@@ -1216,13 +1225,21 @@
     }
     if (data.action === 'multi-video-mode') {
       if (!isTop) {
+        const ownKey = getOwnTaskKey();
+        const selectedForThisFrame = Boolean(data.inheritedFocus || (data.focusKey && ownKey && data.focusKey === ownKey));
         multiVideoMode = Boolean(data.active);
-        if (data.resetFocus) taskFocusGranted = false;
+        if (data.resetFocus) taskFocusGranted = selectedForThisFrame;
         if (!multiVideoMode || !taskFocusGranted) {
           if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
           releaseMediaOwnership();
+        } else {
+          currentTaskStatusCheckedAt = 0;
+          window.setTimeout(() => {
+            scanMedia();
+            tryPlay();
+          }, 0);
         }
-        sendToChildren(data);
+        sendToChildren({ ...data, inheritedFocus: selectedForThisFrame });
       }
       return;
     }
@@ -1231,6 +1248,7 @@
         multiVideoMode = true;
         taskFocusGranted = true;
         currentTaskStatusCheckedAt = 0;
+        sendToChildren({ ...data, inheritedFocus: true });
         window.setTimeout(() => {
           scanMedia();
           tryPlay();
@@ -2245,6 +2263,7 @@
   function resetVideoTaskFocus() {
     selectedVideoTaskFrame = null;
     selectedVideoTaskKey = '';
+    lastVideoTaskFocusAt = 0;
     if (!isTop) return;
     sendToChildren({
       kind: MESSAGE_KIND,
@@ -2260,13 +2279,15 @@
     if (selectedVideoTaskFrame === item.frame && selectedVideoTaskKey === item.key) return true;
     selectedVideoTaskFrame = item.frame;
     selectedVideoTaskKey = item.key;
+    lastVideoTaskFocusAt = Date.now();
     multiVideoAdvanceSignature = '';
     sendToChildren({
       kind: MESSAGE_KIND,
       id: makeId(),
       action: 'multi-video-mode',
       active: true,
-      resetFocus: true
+      resetFocus: true,
+      focusKey: item.key
     });
     postMessageToVideoFrame(item.frame, {
       kind: MESSAGE_KIND,
@@ -2311,7 +2332,16 @@
     const states = getVideoTaskStates(document);
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     const selectedPending = pending.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
-    if (selectedPending) return;
+    if (selectedPending) {
+      // Re-send periodically in case the selected player iframe loaded after the
+      // first grant or the page replaced its inner document.
+      if (Date.now() - lastVideoTaskFocusAt > 4000) {
+        selectedVideoTaskFrame = null;
+        selectedVideoTaskKey = '';
+        focusVideoTask(selectedPending);
+      }
+      return;
+    }
 
     if (pending.length > 0) {
       focusVideoTask(pending[0]);
