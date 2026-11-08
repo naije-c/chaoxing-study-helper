@@ -2,7 +2,7 @@
 
 面向超星学习通的 Tampermonkey 用户脚本，提供视频播放、复制粘贴限制解除、章节测验辅助和自动任务跳转等基础功能。
 
-![Version](https://img.shields.io/badge/version-2.6.19-blue)
+![Version](https://img.shields.io/badge/version-2.6.20-blue)
 ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-compatible-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -63,7 +63,7 @@
 https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js
 ```
 
-安装后请在 Tampermonkey 管理面板确认版本号为 **2.6.19**。
+安装后请在 Tampermonkey 管理面板确认版本号为 **2.6.20**。
 
 ## 更新脚本
 
@@ -200,7 +200,7 @@ i.chaoxing.com
 
 ### 视频不自动播放
 
-1. 先确认 Tampermonkey 里的版本是 **2.6.19**（更新后行为没变化多半是版本没更新）。
+1. 先确认 Tampermonkey 里的版本是 **2.6.20**（更新后行为没变化多半是版本没更新）。
 2. 刷新课程页面。
 3. 看面板提示：
    - "已选择未完成任务…正在等待视频开始"：播放器没有响应，手动点一下视频即可。
@@ -222,11 +222,12 @@ i.chaoxing.com
 - 2.6.17 起，非选中播放器只在切换任务时暂停一次，不再每 1.5 秒反复暂停，减少触发 9010 的 pause/resume 循环。
 - 2.6.18 起，非选中播放器的 `play()` 会被暂时阻止（切回该任务时恢复），避免站点自动拉起后与脚本互相暂停/恢复。
 - 2.6.19 起，额外在 `HTMLMediaElement.prototype.play` 层拦截，防止播放器绕过实例方法重新播放。
+- 2.6.20 起，切换任务时用显式 `task-blur` 撤销旧任务，避免 key 不匹配导致每 1.5 秒反复撤销/恢复焦点。
 - 不要同时启用多个同类学习脚本。
 
 ### 全部任务点完成后不跳转
 
-- 确认版本是 **2.6.19**，旧版只处理"多视频且所有卡片都还在"的情况。
+- 确认版本是 **2.6.20**，旧版只处理"多视频且所有卡片都还在"的情况。
 - 2.6.11 起，平台同步滞后的任务点状态不会再覆盖页面上的"任务点已完成"标记。
 - 2.6.12 起，如果左侧目录里当前章节显示"已完成"，即使某个任务点状态滞后也会直接进入下一节。
 - 脚本不会在视频仍在播放时跳转；等当前视频结束。
@@ -285,6 +286,7 @@ git push
 ## License
 
 [MIT](LICENSE)
+
 
 
 

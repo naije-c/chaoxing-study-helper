@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.19
+// @version      2.6.20
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -1601,29 +1601,34 @@
       if (isTop) handleMediaClaimMessage(data, event.source);
       return;
     }
+    if (data.action === 'task-blur') {
+      if (!isTop) {
+        taskFocusGranted = false;
+        topPlaybackControl = false;
+        blockAllMediaPlayback();
+        if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
+        releaseMediaOwnership();
+        sendToChildren(data);
+      }
+      return;
+    }
     if (data.action === 'multi-video-mode') {
       if (!isTop) {
         const ownKey = getOwnTaskKey();
-        let selectedForThisFrame = Boolean(
+        const selectedForThisFrame = Boolean(
           data.inheritedFocus || (data.focusKey && ownKey && data.focusKey === ownKey)
         );
-        if (!selectedForThisFrame && data.active && data.focusKey && !data.resetFocus) {
-          // A repeat broadcast from the top frame must never silently drop the
-          // grant while the selected player is still starting up.
-          selectedForThisFrame = taskFocusGranted;
-        }
-        multiVideoMode = Boolean(data.active);
-        // Only the frame that actually owns the current task may play. Giving
-        // every child top-control made all players auto-start, and the top
-        // frame then had to pause them forever (visible video switching).
-        topPlaybackControl = Boolean(data.active) && selectedForThisFrame;
-        if (data.resetFocus) taskFocusGranted = selectedForThisFrame;
-        else if (selectedForThisFrame) taskFocusGranted = true;
-        if (!multiVideoMode || !taskFocusGranted) {
+        const active = Boolean(data.active);
+        multiVideoMode = active;
+        if (!active) {
+          taskFocusGranted = false;
+          topPlaybackControl = false;
           blockAllMediaPlayback();
           if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
           releaseMediaOwnership();
-        } else {
+        } else if (selectedForThisFrame) {
+          taskFocusGranted = true;
+          topPlaybackControl = true;
           unblockAllMediaPlayback();
           currentTaskStatusCheckedAt = 0;
           window.setTimeout(() => {
@@ -1631,7 +1636,11 @@
             tryPlay();
           }, 0);
         }
-        sendToChildren({ ...data, inheritedFocus: selectedForThisFrame });
+        // An active broadcast that does not name this frame must not revoke a
+        // direct task-focus grant. Selection changes are signalled explicitly by
+        // task-blur; key/index mismatches used to revoke here every 1.5s and
+        // caused the pause/play alternation.
+        sendToChildren({ ...data, inheritedFocus: selectedForThisFrame || taskFocusGranted });
       }
       return;
     }
@@ -3040,6 +3049,13 @@
   }
 
   function resetVideoTaskFocus() {
+    if (isTop && selectedVideoTaskFrame?.isConnected) {
+      postMessageToVideoFrame(selectedVideoTaskFrame, {
+        kind: MESSAGE_KIND,
+        id: makeId(),
+        action: 'task-blur'
+      });
+    }
     selectedVideoTaskFrame = null;
     selectedVideoTaskKey = '';
     selectedTaskSince = 0;
@@ -3070,6 +3086,13 @@
     }
     if (taskSwitchSuppressed()) return false;
     if (lastTaskSwitchAt && Date.now() - lastTaskSwitchAt < TASK_SWITCH_COOLDOWN_MS) return false;
+    if (selectedVideoTaskFrame && selectedVideoTaskFrame !== item.frame) {
+      postMessageToVideoFrame(selectedVideoTaskFrame, {
+        kind: MESSAGE_KIND,
+        id: makeId(),
+        action: 'task-blur'
+      });
+    }
     selectedVideoTaskFrame = item.frame;
     selectedVideoTaskKey = item.key;
     selectedTaskSince = Date.now();
@@ -4090,6 +4113,7 @@
 
   start();
 })();
+
 
 
 
