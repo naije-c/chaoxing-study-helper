@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.7
+// @version      2.6.8
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -218,9 +218,6 @@
   let quizAutoNextTimer = 0;
   let lastVideoCompletionSignature = '';
   let lastVideoAutoActionSignature = '';
-  let completedTaskAutoNextSignature = '';
-  let completedTaskAutoNextAttempts = 0;
-  let completedTaskAutoNextDone = false;
   let videoAutoActionTimer = 0;
   let mediaOwnerId = '';
   let activeMediaOwnerId = '';
@@ -2641,6 +2638,14 @@
     return list;
   }
 
+  // A task point is still in progress when any of its media is playing. Never
+  // jump to the next section while that is true, even if the card markers have
+  // already flipped to "任务点已完成".
+  function anyTaskMediaPlaying(states) {
+    return states.some((item) => mediaInsideFrame(item.frame)
+      .some((media) => media.isConnected && !media.paused && !media.ended));
+  }
+
   function taskPlaybackSuppressed() {
     return Date.now() < taskPlaySuppressedUntil;
   }
@@ -2883,15 +2888,15 @@
     if (videoAutoActionTimer) return;
 
     const states = getVideoTaskStates(document);
-    const pending = states.filter((item) => item.state.known && !item.state.completed);
-    // Even a single-video section goes through the same selection so the top
-    // frame can start the same-origin player directly; the message handshake
-    // alone is not reliable on every player build.
-    if (!isMultiVideoTaskPage() && !pending.length) {
+    // No video task point on this page (text/quiz/discussion chapter): never
+    // treat "nothing pending" as "all videos done" and click next by itself.
+    if (!states.length) {
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       return;
     }
-
+    const pending = states.filter((item) => item.state.known && !item.state.completed);
+    // The same coordinator handles single-video sections: after the only task
+    // completes there is nothing pending, and the advance path below must run.
     const selectedPending = pending.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
     if (selectedPending) {
       videoTaskWaitSignature = '';
@@ -2915,20 +2920,22 @@
       return;
     }
 
-    if (!isMultiVideoTaskPage()) {
-      if (selectedVideoTaskFrame) resetVideoTaskFocus();
-      return;
-    }
-
     const unknown = states.filter((item) => !item.state.known);
     if (unknown.length > 0) {
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       // A still-playing video is an unfinished task point; do not skip it.
-      if (Array.from(document.querySelectorAll('video,audio')).some((media) => media.isConnected && !media.paused && !media.ended)) {
+      if (anyTaskMediaPlaying(states)) {
         reportStatus('video-task-waiting', { message: '检测到视频仍在播放，等待其结束后再继续。' });
         return;
       }
       if (scheduleUnknownTaskWait(unknown.length)) return;
+    }
+
+    // Even when all markers say completed, a video the learner is still
+    // watching must finish before the section is left.
+    if (anyTaskMediaPlaying(states)) {
+      reportStatus('video-task-waiting', { message: '检测到视频仍在播放，等待其结束后再继续。' });
+      return;
     }
 
     resetVideoTaskFocus();
@@ -2939,9 +2946,14 @@
     videoAutoActionTimer = 0;
     if (!settings.running || !isTop) return;
     const states = getVideoTaskStates(document);
+    if (!states.length) return;
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     if (pending.length > 0) {
       focusVideoTask(pending[0]);
+      return;
+    }
+    if (anyTaskMediaPlaying(states)) {
+      reportStatus('video-task-waiting', { message: '检测到视频仍在播放，等待其结束后再继续。' });
       return;
     }
 
@@ -3013,65 +3025,10 @@
     }
   }
 
-  // A single-video section can already be finished when the page loads (the
-  // learner watched it in an earlier session). No "ended" event will ever fire
-  // then, so the task-point marker itself has to drive the chapter jump.
-  function handleAlreadyCompletedVideoTask() {
-    if (!isTop || !settings.running || !settings.autoNext) return;
-    if (videoAutoActionTimer) return;
-    if (isMultiVideoTaskPage()) return;
-
-    const frames = videoTaskFrames(document);
-    if (frames.length !== 1) return;
-
-    const states = getVideoTaskStates(document);
-    const state = states[0]?.state;
-    if (!state || !state.known || !state.completed) return;
-
-    const signature = `${location.pathname}|${location.search}|${currentChapterMarker()}|${states[0].key}|${state.label || ''}`;
-    if (signature !== completedTaskAutoNextSignature) {
-      completedTaskAutoNextSignature = signature;
-      completedTaskAutoNextAttempts = 0;
-      completedTaskAutoNextDone = false;
-    }
-    if (completedTaskAutoNextDone) return;
-    // The navigation may be refused once (e.g. while the tab is still loading);
-    // retry on later scan ticks instead of reporting a dead end.
-    if (completedTaskAutoNextAttempts >= 3) {
-      completedTaskAutoNextDone = true;
-      reportStatus('no-next', { message: '任务点已完成，但自动切换未生效，请手动点击“下一节”。' });
-      return;
-    }
-
-    const testTab = findChapterTestTab();
-    if (testTab && testTab.classList.contains('active')) return;
-
-    const delay = Math.max(1, Number(settings.nextDelay) || 3);
-    completedTaskAutoNextAttempts += 1;
-    reportStatus('video-complete', {
-      message: testTab
-        ? `检测到任务点已完成，${delay} 秒后打开章节测验…`
-        : `检测到任务点已完成，${delay} 秒后进入下一节…`
-    });
-    videoAutoActionTimer = window.setTimeout(() => {
-      videoAutoActionTimer = 0;
-      continueAfterVideoTasks();
-      // If the page did not change, the next ticks stop at attempts >= 3; mark
-      // the task as handled so the same page cannot trigger a jump storm.
-      completedTaskAutoNextDone = true;
-    }, delay * 1000) || 1;
-  }
   function scanVideoCompletion() {
     if (!settings.running || !settings.autoNext) {
       lastVideoCompletionSignature = '';
       return;
-    }
-    if (isTop) {
-      try {
-        handleAlreadyCompletedVideoTask();
-      } catch {
-        // Never let a marker lookup break the media scan.
-      }
     }
     if (!currentMedia || !isMediaComplete(currentMedia)) return;
     const signature = `${location.pathname}|${location.search}|${currentMedia.currentSrc || ''}`;
@@ -3817,3 +3774,4 @@
 
   start();
 })();
+
