@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.5
+// @version      2.6.6
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -228,6 +228,7 @@
   let currentTaskStatusCache = null;
   let currentTaskStatusCheckedAt = 0;
   let multiVideoMode = false;
+  let topPlaybackControl = false;
   let taskFocusGranted = false;
   let selectedVideoTaskFrame = null;
   let selectedVideoTaskKey = '';
@@ -242,6 +243,13 @@
   let backgroundInterruptedAt = 0;
   let taskPlayTimer = 0;
   let taskPlayAttempts = 0;
+  // Anti-fight state: never let the helper and the site player toggle the same
+  // media in a loop (that triggered Chaoxing's 9010 anti-abuse captcha).
+  let taskMediaElement = null;
+  let taskPlayResumeTimer = 0;
+  let taskPlaySuppressedUntil = 0;
+  let taskPlayPauses = [];
+  let taskPlayLastPauseAt = 0;
   const seenCommands = new Set();
 
   const isTop = (() => {
@@ -1005,12 +1013,14 @@
   function mediaFinishedInFrame(frame) {
     if (!frame) return false;
     try {
-      const media = mediaInDocument(frame.contentDocument);
-      if (!media) return false;
-      if (media.ended) return true;
-      const duration = Number(media.duration);
-      const current = Number(media.currentTime);
-      return Number.isFinite(duration) && duration > 0 && Number.isFinite(current) && current / duration >= 0.995;
+      const media = mediaInsideFrame(frame);
+      if (!media.length) return false;
+      return media.some((element) => {
+        if (element.ended) return true;
+        const duration = Number(element.duration);
+        const current = Number(element.currentTime);
+        return Number.isFinite(duration) && duration > 0 && Number.isFinite(current) && current / duration >= 0.995;
+      });
     } catch {
       // Cross-origin child frame.
       return false;
@@ -1058,7 +1068,15 @@
     return false;
   }
 
+  // The top frame owns play decisions for same-origin task frames: it reads the
+  // task point state and the <video> element directly. Child frames must not
+  // self-start or self-pause on top of that, or the player is toggled in a loop.
+  function topControlsPlayback() {
+    return isTop || topPlaybackControl;
+  }
+
   function videoPlaybackNeedsFocus() {
+    if (topControlsPlayback()) return false;
     return settings.running && (multiVideoMode || hasMultipleVideoTaskFrames()) && !hasPlaybackFocus();
   }
 
@@ -1256,11 +1274,11 @@
       return;
     }
 
-    if (!forceOwned && mediaOwnerId !== MEDIA_FRAME_ID) {
+    if (!forceOwned && mediaOwnerId !== MEDIA_FRAME_ID && !topControlsPlayback()) {
       if (!mediaOwnerId) requestMediaOwnership();
       if (mediaOwnerId !== MEDIA_FRAME_ID) return;
     }
-    if (mediaOwnerId !== MEDIA_FRAME_ID) return;
+    if (mediaOwnerId !== MEDIA_FRAME_ID && !topControlsPlayback()) return;
 
     const reason = manualInterventionReason();
     if (reason) {
@@ -1342,7 +1360,8 @@
         return;
       }
       // The platform pauses playback when the tab is hidden or blurred. Resume
-      // it right away and keep retrying while the document stays hidden.
+      // it once after a short delay; the top frame's selected-task driver also
+      // retries, and both stop if the player keeps pausing by itself.
       if (document.hidden || document.visibilityState === 'hidden') {
         rememberBackgroundPlayback(media);
         return;
@@ -1536,6 +1555,7 @@
           selectedForThisFrame = taskFocusGranted;
         }
         multiVideoMode = Boolean(data.active);
+        topPlaybackControl = Boolean(data.active);
         if (data.resetFocus) taskFocusGranted = selectedForThisFrame;
         else if (selectedForThisFrame) taskFocusGranted = true;
         if (!multiVideoMode || !taskFocusGranted) {
@@ -1555,6 +1575,7 @@
     if (data.action === 'task-focus') {
       if (!isTop) {
         multiVideoMode = true;
+        topPlaybackControl = true;
         taskFocusGranted = true;
         currentTaskStatusCheckedAt = 0;
         sendToChildren({ ...data, inheritedFocus: true });
@@ -2594,13 +2615,106 @@
     return list;
   }
 
+  function taskPlaybackSuppressed() {
+    return Date.now() < taskPlaySuppressedUntil;
+  }
+
+  // The player itself pauses media for its own reasons (progress save, seek,
+  // anti-cheat checkpoints). Only a genuine pause/play storm suspends us, and
+  // the suspension is short: a manual play by the learner always wins.
+  function noteTaskMediaPause(element) {
+    const now = Date.now();
+    if (element !== taskMediaElement) {
+      taskPlayPauses = [];
+      return;
+    }
+    if (now - taskPlayLastPauseAt < 400) return;
+    taskPlayLastPauseAt = now;
+    taskPlayPauses = taskPlayPauses.filter((at) => now - at < 12000);
+    taskPlayPauses.push(now);
+    if (taskPlayPauses.length >= 3) {
+      taskPlaySuppressedUntil = now + 30000;
+      taskPlayPauses = [];
+      reportStatus('video-task-waiting', {
+        message: '检测到播放器反复暂停，已暂停自动恢复 30 秒以免触发平台异常校验。'
+      });
+    }
+  }
+
+  function bindTaskMediaWatch(element) {
+    if (!element || element === taskMediaElement) return;
+    taskMediaElement = element;
+    taskPlayPauses = [];
+    taskPlayLastPauseAt = 0;
+    taskPlayAttempts = 0;
+    try {
+      element.addEventListener('pause', () => noteTaskMediaPause(element));
+      // A learner pressing play clears the anti-fight suspension.
+      element.addEventListener('play', () => {
+        taskPlayPauses = [];
+        taskPlaySuppressedUntil = 0;
+      });
+    } catch {
+      // Player may replace the element.
+    }
+  }
+
+  // Play an already selected task after a short delay and only when it looks
+  // stalled. Returns true when a resume attempt was actually issued.
+  function scheduleTaskMediaResume(delay = 2500) {
+    if (!isTop || !settings.running || !selectedVideoTaskFrame?.isConnected) return false;
+    if (taskPlaybackSuppressed() || taskPlayResumeTimer) return false;
+    taskPlayResumeTimer = window.setTimeout(() => {
+      taskPlayResumeTimer = 0;
+      if (!settings.running || !selectedVideoTaskFrame?.isConnected || taskPlaybackSuppressed()) return;
+      const media = mediaInsideFrame(selectedVideoTaskFrame)
+        .filter((candidate) => candidate.isConnected && !candidate.ended)
+        .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
+      if (!media) return;
+      bindTaskMediaWatch(media);
+      if (!media.paused) return;
+      // A pause that persists for a few seconds is a real stall, not the
+      // player's own short pause during progress saving.
+      directPlayTaskMedia(selectedVideoTaskFrame);
+    }, delay);
+    return true;
+  }
+
+  // Keep a single selected task playing, but never hammer the player. This is
+  // the only automatic play driver on the page.
+  function keepTaskPlaying() {
+    scheduleTaskMediaResume(2500);
+  }
+
+  // When the learner presses play on a different task point, follow their
+  // choice instead of dragging playback back to the first pending task.
+  function adoptManualTaskPlayback() {
+    if (!isTop || !settings.running) return;
+    for (const item of getVideoTaskStates(document)) {
+      if (item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey) continue;
+      const playing = mediaInsideFrame(item.frame).find((media) => media.isConnected && !media.paused && !media.ended);
+      if (!playing) continue;
+      selectedVideoTaskFrame = item.frame;
+      selectedVideoTaskKey = item.key;
+      lastVideoTaskFocusAt = Date.now();
+      multiVideoAdvanceSignature = '';
+      taskPlayAttempts = 0;
+      reportStatus('video-task-selected', {
+        message: `检测到你在播放${videoTaskLabel(item)}，已切换到此任务点。`
+      });
+      return;
+    }
+  }
+
   function directPlayTaskMedia(frame) {
     if (!isTop || !frame) return false;
+    if (taskPlaybackSuppressed()) return false;
     const media = mediaInsideFrame(frame)
       .filter((candidate) => candidate.isConnected && !candidate.ended)
       .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
     if (!media) return false;
-    // Only one task point may play at a time.
+    if (!media.paused) return false;
+    // Only one task point may play at a time; pause the others when switching.
     for (const item of getVideoTaskStates(document)) {
       if (item.frame === frame) continue;
       for (const other of mediaInsideFrame(item.frame)) {
@@ -2627,39 +2741,6 @@
     }
   }
 
-  function keepTaskPlaying() {
-    if (taskPlayTimer) return;
-    taskPlayAttempts = 0;
-    const tick = () => {
-      taskPlayTimer = 0;
-      if (!isTop || !settings.running || !selectedVideoTaskFrame?.isConnected) return;
-      if (taskPlayAttempts >= 40) return;
-      const state = getVideoTaskStates(document)
-        .find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
-      if (!state || state.state.completed) return;
-      const media = mediaInsideFrame(selectedVideoTaskFrame).filter((candidate) => candidate.isConnected && !candidate.ended);
-      if (media.length && media.every((candidate) => !candidate.paused)) {
-        taskPlayAttempts = 0;
-        taskPlayTimer = window.setTimeout(tick, 2000);
-        return;
-      }
-      taskPlayAttempts += 1;
-      directPlayTaskMedia(selectedVideoTaskFrame);
-      taskPlayTimer = window.setTimeout(tick, 1200);
-    };
-    taskPlayTimer = window.setTimeout(tick, 300);
-  }
-
-  // Runs on every scan tick: keeps the selected task playing even when the
-  // player frame's own autoplay/visibility handling failed.
-  function coordinateSelectedTaskPlayback() {
-    if (!isTop || !settings.running || !selectedVideoTaskFrame?.isConnected) return;
-    const media = mediaInsideFrame(selectedVideoTaskFrame).filter((candidate) => candidate.isConnected && !candidate.ended);
-    if (!media.length) return;
-    if (media.every((candidate) => !candidate.paused)) return;
-    directPlayTaskMedia(selectedVideoTaskFrame);
-  }
-
   function resetVideoTaskFocus() {
     selectedVideoTaskFrame = null;
     selectedVideoTaskKey = '';
@@ -2667,6 +2748,8 @@
     taskPlayAttempts = 0;
     clearTimeout(taskPlayTimer);
     taskPlayTimer = 0;
+    clearTimeout(taskPlayResumeTimer);
+    taskPlayResumeTimer = 0;
     if (!isTop) return;
     sendToChildren({
       kind: MESSAGE_KIND,
@@ -2754,6 +2837,7 @@
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       return;
     }
+    adoptManualTaskPlayback();
     if (videoAutoActionTimer) return;
 
     const states = getVideoTaskStates(document);
@@ -2776,8 +2860,8 @@
         selectedVideoTaskFrame = null;
         selectedVideoTaskKey = '';
         focusVideoTask(selectedPending);
-      } else if (!taskPlayTimer) {
-        keepTaskPlaying();
+      } else {
+        scheduleTaskMediaResume(2500);
       }
       return;
     }
@@ -3624,9 +3708,6 @@
         scanMedia();
         if (isTop) coordinateVideoTasks();
         if (isTop) syncFocusToChildren();
-        // While running, top-level playback must survive platform pauses and
-        // hidden tabs even when the player frame's own script is inactive.
-        if (isTop && settings.running) coordinateSelectedTaskPlayback();
         ensurePanel();
         if (isTop) {
           broadcastAction('manual-check');
