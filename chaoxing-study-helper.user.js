@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.2
+// @version      2.6.3
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -235,6 +235,11 @@
   let multiVideoAdvanceSignature = '';
   let videoTaskWaitSignature = '';
   let videoTaskWaitStartedAt = 0;
+  let lastFocusSyncAt = 0;
+  let playbackFocusAbort = null;
+  let backgroundResumeTimer = 0;
+  let backgroundResumeAttempts = 0;
+  let backgroundInterruptedAt = 0;
   const seenCommands = new Set();
 
   const isTop = (() => {
@@ -474,7 +479,11 @@
       if (sourceFrame && sourceFrame !== selectedVideoTaskFrame) return;
       if (!sourceFrame && selectedVideoTaskKey && data.taskKey !== selectedVideoTaskKey) return;
     }
-    if (sourceFrame) {
+    // The selected task point is already the top frame's decision. Do not reject
+    // its claim just because its marker is unreadable in this snapshot: that
+    // would deadlock the player (no owner, no play) until the next election.
+    const isSelectedFrame = Boolean(sourceFrame && sourceFrame === selectedVideoTaskFrame);
+    if (sourceFrame && !isSelectedFrame) {
       const sourceState = readTaskStateFromFrameElement(sourceFrame);
       if (sourceState.known && sourceState.completed) return;
       if (isMultiVideoTaskPage() && !sourceState.known) return;
@@ -627,6 +636,18 @@
     }
   }
 
+  // A frame nested inside another frame's document must not inherit the outer
+  // task iframe's data-jobid.
+  function frameIsInsideAnotherFrame(frame) {
+    try {
+      if (frame.parentElement?.tagName === 'IFRAME') return true;
+      if (frame.parentElement?.tagName !== 'BODY') return false;
+      return Boolean(frame.ownerDocument?.defaultView?.frameElement);
+    } catch {
+      return false;
+    }
+  }
+
   // A frame nested inside another frame's document only sees data-jobid on its
   // own element: the outer iframe is reachable through the window hierarchy,
   // never through DOM ancestry. The walk therefore jumps to the host element of
@@ -644,6 +665,9 @@
 
   function parseFrameData(frame) {
     if (!frame) return {};
+    // A nested player frame must not inherit the jobid of the task iframe that
+    // hosts it: that would turn the player into a phantom task point.
+    const walkAncestors = !frameIsInsideAnotherFrame(frame);
     let node = frame;
     for (let depth = 0; node && depth < 9; depth++) {
       try {
@@ -663,8 +687,14 @@
       } catch {
         break;
       }
+      if (!walkAncestors) break;
+      const parent = node.parentElement;
+      if (parent && parent.tagName !== 'IFRAME' && parent !== node.ownerDocument?.body && parent !== node.ownerDocument?.documentElement) {
+        node = parent;
+        continue;
+      }
       const parentDoc = node.ownerDocument;
-      node = hostFrameElementOf(parentDoc);
+      node = parentDoc && parentDoc !== document ? hostFrameElementOf(parentDoc) : null;
     }
     try {
       const url = new URL(frame.getAttribute('src') || frame.src || '', location.href);
@@ -778,10 +808,10 @@
     // Chaoxing's own video task module.
     if (/\/ananas\/modules\/video|modules\/video\/index\.html/i.test(src)) return true;
     if (!/video/i.test(src)) return false;
-    // A bare "video" match is too broad: on single-video sections it also hits
-    // the player frame nested inside the video task iframe, which has no task
-    // point markup and would otherwise stay "unknown" forever.
-    if (frame.parentElement?.tagName === 'IFRAME') return false;
+    // A bare "video" match is too broad. A player frame either lives in the same
+    // document as its task iframe (nested DOM) or in a document that is itself
+    // hosted by another frame (the task iframe). Both are not task points.
+    if (frameIsInsideAnotherFrame(frame)) return false;
     return Boolean(frame.getBoundingClientRect().height);
   }
 
@@ -909,9 +939,19 @@
         } catch {
           // Cross-origin child frame.
         }
-        if (hasInlineMedia || isTaskCandidateFrame(frame)) {
-          result.push(frame);
+        const ownTaskModule = /\/ananas\/modules\/video|modules\/video\/index\.html/i.test(
+          String(frame.getAttribute('src') || frame.src || '')
+        );
+        // A frame inside another frame's document is a player when its host
+        // iframe is itself the video task module: counting it would add a
+        // phantom task point ("第 1 个视频任务点" + a task that never completes).
+        let nestedInTaskFrame = false;
+        if (root !== doc) {
+          const host = hostFrameElementOf(root);
+          nestedInTaskFrame = Boolean(host && /video|ananas/i.test(String(host.getAttribute('src') || host.src || '')));
         }
+        const isTaskPoint = hasInlineMedia || (root === doc ? isTaskCandidateFrame(frame) : ownTaskModule && !nestedInTaskFrame);
+        if (isTaskPoint) result.push(frame);
         try {
           if (frame.contentDocument) walk(frame.contentDocument, depth + 1);
         } catch {
@@ -982,8 +1022,100 @@
 
   // Multi-video pages are coordinated by the top frame; a child must not start
   // autoplaying before it has been granted the next unfinished task point.
+  function hasPlaybackFocus() {
+    if (taskFocusGranted) return true;
+    // The top frame holds the media itself on some layouts: there is nobody to
+    // grant it, so it may always play the task point it selected.
+    if (isTop) return true;
+    try {
+      const ownerDoc = window.frameElement?.ownerDocument;
+      if (ownerDoc && ownerDoc === document) return true;
+    } catch {
+      // Cross-origin parent.
+    }
+    return false;
+  }
+
   function videoPlaybackNeedsFocus() {
-    return settings.running && (multiVideoMode || hasMultipleVideoTaskFrames()) && !taskFocusGranted;
+    return settings.running && (multiVideoMode || hasMultipleVideoTaskFrames()) && !hasPlaybackFocus();
+  }
+
+  // A chapter can be swapped without a page load, so the top frame re-applies
+  // its current decision instead of relying on a frame keeping its state.
+  function syncFocusToChildren(force = false) {
+    if (!isTop) return;
+    if (!settings.running) return;
+    const now = Date.now();
+    if (!force && now - lastFocusSyncAt < 1000) return;
+    lastFocusSyncAt = now;
+    if (!isMultiVideoTaskPage()) return;
+    const states = getVideoTaskStates(document);
+    const pending = states.filter((item) => item.state.known && !item.state.completed);
+    if (!pending.length) return;
+    const item = pending.find((candidate) => candidate.frame === selectedVideoTaskFrame && candidate.key === selectedVideoTaskKey)
+      || pending[0];
+    if (!item.frame.isConnected) return;
+    // Only adopt a new target here; focusVideoTask() keeps timers and the
+    // "video-task-selected" message for the real transition.
+    if (item.frame !== selectedVideoTaskFrame || item.key !== selectedVideoTaskKey) {
+      selectedVideoTaskFrame = item.frame;
+      selectedVideoTaskKey = item.key;
+      lastVideoTaskFocusAt = now;
+      multiVideoAdvanceSignature = '';
+    }
+    sendToChildren({
+      kind: MESSAGE_KIND,
+      id: makeId(),
+      action: 'multi-video-mode',
+      active: true,
+      focusKey: item.key,
+      taskKey: item.key
+    });
+  }
+
+  // Media that was playing before the tab lost focus must keep playing.
+  function resumeBackgroundPlayback(reason = 'visibility', force = false) {
+    if (!settings.running || !currentMedia || !currentMedia.isConnected) return;
+    if (currentMedia.ended) return;
+    if (shouldSkipCompletedVideoTask()) return;
+    if (videoPlaybackNeedsFocus()) {
+      // A pending task point cannot be resumed without a grant; the top frame
+      // re-syncs focus every few seconds and this call runs again.
+      if (isTop) syncFocusToChildren(true);
+      return;
+    }
+    if (mediaOwnerId && mediaOwnerId !== MEDIA_FRAME_ID) return;
+    if (!force && !currentMedia.paused) return;
+    backgroundInterruptedAt = Date.now();
+    try {
+      applyMediaSettings();
+    } catch {
+      // Player properties may be temporarily locked.
+    }
+    tryPlay();
+  }
+
+  function rememberBackgroundPlayback(media) {
+    if (!settings.running) return;
+    backgroundResumeAttempts = 0;
+    clearTimeout(backgroundResumeTimer);
+    const delays = [0, 400, 1000, 2000, 4000];
+    const schedule = (step) => {
+      if (step >= delays.length) return;
+      backgroundResumeTimer = window.setTimeout(() => {
+        if (!settings.running) return;
+        const target = currentMedia || media;
+        if (currentMedia && (!currentMedia.isConnected || currentMedia.ended)) return;
+        if (target && !target.paused) return;
+        // The site's own visibility handler pauses the player; resume it.
+        if (mediaOwnerId && mediaOwnerId !== MEDIA_FRAME_ID) return;
+        backgroundResumeAttempts = step + 1;
+        scanMedia();
+        tryPlay();
+        schedule(step + 1);
+      }, delays[step]);
+    };
+    schedule(0);
   }
 
   function scrollCurrentVideoTaskIntoView() {
@@ -1175,6 +1307,9 @@
       }
       if (settings.running && mediaOwnerId !== MEDIA_FRAME_ID) requestMediaOwnership();
       applyMediaSettings();
+      backgroundResumeAttempts = 0;
+      clearTimeout(backgroundResumeTimer);
+      backgroundResumeTimer = 0;
       reportStatus('playing');
     }, { signal });
 
@@ -1182,6 +1317,12 @@
       if (!settings.running || media.ended) return;
       if (manualInterventionReason()) {
         reportStatus('manual', { message: manualInterventionReason() });
+        return;
+      }
+      // The platform pauses playback when the tab is hidden or blurred. Resume
+      // it right away and keep retrying while the document stays hidden.
+      if (document.hidden || document.visibilityState === 'hidden') {
+        rememberBackgroundPlayback(media);
         return;
       }
       clearTimeout(retryTimer);
@@ -1217,6 +1358,9 @@
         if (!media.paused) { try { media.pause(); } catch {} }
       }
       releaseMediaOwnership();
+      // Ask the top frame for the grant again; the periodic re-sync also covers
+      // the case where the grant message was missed while this frame loaded.
+      if (isTop) syncFocusToChildren(true);
       return;
     }
     if (currentMedia && currentMedia.isConnected) {
@@ -1361,9 +1505,17 @@
     if (data.action === 'multi-video-mode') {
       if (!isTop) {
         const ownKey = getOwnTaskKey();
-        const selectedForThisFrame = Boolean(data.inheritedFocus || (data.focusKey && ownKey && data.focusKey === ownKey));
+        let selectedForThisFrame = Boolean(
+          data.inheritedFocus || (data.focusKey && ownKey && data.focusKey === ownKey)
+        );
+        if (!selectedForThisFrame && data.active && data.focusKey && !data.resetFocus) {
+          // A repeat broadcast from the top frame must never silently drop the
+          // grant while the selected player is still starting up.
+          selectedForThisFrame = taskFocusGranted;
+        }
         multiVideoMode = Boolean(data.active);
         if (data.resetFocus) taskFocusGranted = selectedForThisFrame;
+        else if (selectedForThisFrame) taskFocusGranted = true;
         if (!multiVideoMode || !taskFocusGranted) {
           if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
           releaseMediaOwnership();
@@ -3344,6 +3496,7 @@
         maintainMediaOwnership();
         scanMedia();
         if (isTop) coordinateVideoTasks();
+        if (isTop) syncFocusToChildren();
         ensurePanel();
         if (isTop) {
           broadcastAction('manual-check');
@@ -3358,13 +3511,46 @@
       }, 1500);
 
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && settings.running) {
-          window.setTimeout(tryPlay, 500);
+        if (document.hidden) {
+          // Keep the player alive in the background; the platform pauses it.
+          rememberBackgroundPlayback(currentMedia);
+          return;
         }
+        window.setTimeout(() => {
+          resumeBackgroundPlayback('visible', true);
+          if (settings.running) {
+            // Re-apply playback settings after the platform restored its UI.
+            window.setTimeout(tryPlay, 400);
+          }
+        }, 200);
+      });
+
+      // Switching tabs fires blur but not always visibilitychange.
+      window.addEventListener('blur', () => {
+        if (!settings.running) return;
+        backgroundInterruptedAt = Date.now();
+        rememberBackgroundPlayback(currentMedia);
+      });
+      window.addEventListener('focus', () => {
+        if (!settings.running) return;
+        window.setTimeout(() => resumeBackgroundPlayback('focus', false), 300);
+      });
+      document.addEventListener('freeze', () => {
+        rememberBackgroundPlayback(currentMedia);
+      });
+      document.addEventListener('resume', () => {
+        window.setTimeout(() => resumeBackgroundPlayback('resume', true), 200);
+      });
+      window.addEventListener('pageshow', (event) => {
+        if (!event.persisted) return;
+        window.setTimeout(() => resumeBackgroundPlayback('pageshow', true), 300);
       });
 
       if (settings.running) {
-        window.setTimeout(tryPlay, 500);
+        window.setTimeout(() => {
+          if (isTop) syncFocusToChildren(true);
+          tryPlay();
+        }, 500);
       }
     };
 
