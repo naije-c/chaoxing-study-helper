@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.8
+// @version      2.6.9
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -70,6 +70,12 @@
   // How long the multi-video coordinator waits for unreadable task-point states
   // before assuming they are finished task points and moving on.
   const VIDEO_TASK_WAIT_MS = 16000;
+  // Selection hysteresis: the site can auto-play several players at once, and
+  // following every "playing" frame causes a switch storm (and platform captcha).
+  const TASK_SWITCH_COOLDOWN_MS = 3000;
+  const TASK_SWITCH_WINDOW_MS = 20000;
+  const TASK_SWITCH_MAX = 3;
+  const TASK_SWITCH_SUPPRESS_MS = 30000;
 
   const DEFAULT_AI_SETTINGS = Object.freeze({
     endpoint: '',
@@ -240,6 +246,10 @@
   let backgroundInterruptedAt = 0;
   let taskPlayTimer = 0;
   let taskPlayAttempts = 0;
+  let lastTaskSwitchAt = 0;
+  let taskSwitchTimes = [];
+  let taskSwitchSuppressedUntil = 0;
+  let taskPageSignature = '';
   // Anti-fight state: never let the helper and the site player toggle the same
   // media in a loop (that triggered Chaoxing's 9010 anti-abuse captcha).
   let taskMediaElement = null;
@@ -1115,17 +1125,11 @@
     const states = getVideoTaskStates(document);
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     if (!pending.length) return;
-    const item = pending.find((candidate) => candidate.frame === selectedVideoTaskFrame && candidate.key === selectedVideoTaskKey)
-      || pending[0];
-    if (!item.frame.isConnected) return;
-    // Only adopt a new target here; focusVideoTask() keeps timers and the
-    // "video-task-selected" message for the real transition.
-    if (item.frame !== selectedVideoTaskFrame || item.key !== selectedVideoTaskKey) {
-      selectedVideoTaskFrame = item.frame;
-      selectedVideoTaskKey = item.key;
-      lastVideoTaskFocusAt = now;
-      multiVideoAdvanceSignature = '';
-    }
+    // Only re-broadcast the current selection. Picking a new target here as
+    // well as in coordinateVideoTasks() caused two independent switchers to
+    // fight over the same frames.
+    const item = pending.find((candidate) => candidate.frame === selectedVideoTaskFrame && candidate.key === selectedVideoTaskKey);
+    if (!item?.frame?.isConnected) return;
     sendToChildren({
       kind: MESSAGE_KIND,
       id: makeId(),
@@ -2718,18 +2722,70 @@
   }
 
   // When the learner presses play on a different task point, follow their
-  // choice instead of dragging playback back to the first pending task.
+  // choice instead of dragging playback back to the first pending task. Only a
+  // real recent user gesture counts: the site itself may auto-play several
+  // players, and chasing those causes a switch storm.
+  function taskSwitchSuppressed() {
+    return Date.now() < taskSwitchSuppressedUntil;
+  }
+
+  function userGestureRecentlyActive() {
+    try {
+      const activation = navigator.userActivation;
+      if (!activation) return true;
+      return Boolean(activation.isActive);
+    } catch {
+      return true;
+    }
+  }
+
+  function noteTaskSwitch() {
+    const now = Date.now();
+    taskSwitchTimes = taskSwitchTimes.filter((at) => now - at < TASK_SWITCH_WINDOW_MS);
+    taskSwitchTimes.push(now);
+    lastTaskSwitchAt = now;
+    if (taskSwitchTimes.length > TASK_SWITCH_MAX) {
+      taskSwitchSuppressedUntil = now + TASK_SWITCH_SUPPRESS_MS;
+      taskSwitchTimes = [];
+      reportStatus('video-task-waiting', {
+        message: '检测到在多个视频之间反复切换，已暂停自动选片 30 秒以免触发平台校验；请手动选择一个视频。'
+      });
+    }
+  }
+
+  function sendTaskFocusMessages(item) {
+    if (!item?.frame) return;
+    sendToChildren({
+      kind: MESSAGE_KIND,
+      id: makeId(),
+      action: 'multi-video-mode',
+      active: true,
+      focusKey: item.key
+    });
+    postMessageToVideoFrame(item.frame, {
+      kind: MESSAGE_KIND,
+      id: makeId(),
+      action: 'task-focus',
+      taskKey: item.key
+    });
+  }
+
   function adoptManualTaskPlayback() {
     if (!isTop || !settings.running) return;
+    if (taskSwitchSuppressed()) return;
+    if (!userGestureRecentlyActive()) return;
+    const now = Date.now();
+    if (now - lastTaskSwitchAt < TASK_SWITCH_COOLDOWN_MS) return;
     for (const item of getVideoTaskStates(document)) {
       if (item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey) continue;
       const playing = mediaInsideFrame(item.frame).find((media) => media.isConnected && !media.paused && !media.ended);
       if (!playing) continue;
       selectedVideoTaskFrame = item.frame;
       selectedVideoTaskKey = item.key;
-      lastVideoTaskFocusAt = Date.now();
+      lastVideoTaskFocusAt = now;
       multiVideoAdvanceSignature = '';
       taskPlayAttempts = 0;
+      noteTaskSwitch();
       reportStatus('video-task-selected', {
         message: `检测到你在播放${videoTaskLabel(item)}，已切换到此任务点。`
       });
@@ -2809,26 +2865,24 @@
 
   function focusVideoTask(item) {
     if (!isTop || !item?.frame?.isConnected) return false;
-    if (selectedVideoTaskFrame === item.frame && selectedVideoTaskKey === item.key) return true;
+    if (selectedVideoTaskFrame === item.frame && selectedVideoTaskKey === item.key) {
+      // Re-grant without counting a switch: the same selection is re-broadcast
+      // periodically in case the player iframe reloaded.
+      lastVideoTaskFocusAt = Date.now();
+      sendTaskFocusMessages(item);
+      return true;
+    }
+    if (selectedVideoTaskFrame?.isConnected) {
+      if (taskSwitchSuppressed()) return false;
+      if (Date.now() - lastTaskSwitchAt < TASK_SWITCH_COOLDOWN_MS) return false;
+    }
     selectedVideoTaskFrame = item.frame;
     selectedVideoTaskKey = item.key;
     lastVideoTaskFocusAt = Date.now();
     multiVideoAdvanceSignature = '';
-    sendToChildren({
-      kind: MESSAGE_KIND,
-      id: makeId(),
-      action: 'multi-video-mode',
-      active: true,
-      resetFocus: true,
-      focusKey: item.key
-    });
-    postMessageToVideoFrame(item.frame, {
-      kind: MESSAGE_KIND,
-      id: makeId(),
-      action: 'task-focus',
-      taskKey: item.key
-    });
+    sendTaskFocusMessages(item);
     keepTaskPlaying();
+    noteTaskSwitch();
     reportStatus('video-task-selected', {
       message: `已选择未完成任务：${videoTaskLabel(item)}，正在等待视频开始…`
     });
@@ -2884,6 +2938,13 @@
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       return;
     }
+    const pageSignature = `${location.pathname}|${location.search}|${currentChapterMarker()}`;
+    if (pageSignature !== taskPageSignature) {
+      taskPageSignature = pageSignature;
+      taskSwitchTimes = [];
+      lastTaskSwitchAt = 0;
+      taskSwitchSuppressedUntil = 0;
+    }
     adoptManualTaskPlayback();
     if (videoAutoActionTimer) return;
 
@@ -2901,15 +2962,23 @@
     if (selectedPending) {
       videoTaskWaitSignature = '';
       videoTaskWaitStartedAt = 0;
-      // Re-send periodically in case the selected player iframe loaded after the
-      // first grant or the page replaced its inner document.
+      // Re-send the grant without dropping the selection: resetting it every 4s
+      // made other players look eligible and caused switching.
       if (Date.now() - lastVideoTaskFocusAt > 4000) {
-        selectedVideoTaskFrame = null;
-        selectedVideoTaskKey = '';
-        focusVideoTask(selectedPending);
+        lastVideoTaskFocusAt = Date.now();
+        sendTaskFocusMessages(selectedPending);
       } else {
         scheduleTaskMediaResume(2500);
       }
+      return;
+    }
+
+    // The selected task's marker may be unreadable for a moment, but if its
+    // video is still playing the learner is watching it: never switch away.
+    const selectedItem = states.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
+    if (selectedItem && !selectedItem.state.known
+      && mediaInsideFrame(selectedItem.frame).some((media) => media.isConnected && !media.paused && !media.ended)) {
+      scheduleTaskMediaResume(2500);
       return;
     }
 
@@ -3774,4 +3843,5 @@
 
   start();
 })();
+
 
