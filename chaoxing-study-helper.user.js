@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.6
+// @version      2.6.7
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -874,6 +874,29 @@
     return null;
   }
 
+  // Real Chaoxing cards often render the completed state as a visible check
+  // icon beside the player rather than text inside the card. Look at the
+  // closest visible marker without walking into another video card.
+  function completedMarkerNear(frame) {
+    let node = frame?.parentElement;
+    for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+      try {
+        if (node === frame.ownerDocument?.body || node === frame.ownerDocument?.documentElement) return null;
+        const others = Array.from(node.querySelectorAll('iframe'))
+          .filter((candidate) => candidate !== frame && isTaskCandidateFrame(candidate)).length;
+        if (others > 0) return null;
+        const marker = Array.from(node.querySelectorAll(TASK_COMPLETED_SELECTOR))
+          .find((element) => element.ownerDocument === node.ownerDocument && isVisible(element));
+        if (marker) return { known: true, completed: true, taskPoint: true, label: '' };
+        const text = readableTaskText(node);
+        if (TASK_COMPLETED_TEXT.test(text)) return { known: true, completed: true, taskPoint: true, label: '' };
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
   function readTaskStateFromFrameElement(frame) {
     if (!frame) return { known: false, completed: false, taskPoint: false };
     const attachmentState = readAttachmentTaskState(frame);
@@ -888,6 +911,9 @@
       const sharedState = taskStateFromContainer(shared);
       if (sharedState) return sharedState;
     }
+
+    const marker = completedMarkerNear(frame);
+    if (marker) return marker;
 
     // Last resort: a task point that is visibly "任务点" but carries no state
     // marker is treated as pending, which keeps playback conservative.
@@ -2714,6 +2740,16 @@
       .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
     if (!media) return false;
     if (!media.paused) return false;
+    // If the player keeps pausing right after our resume, stop fighting it:
+    // that is what produced the pause/play storm and the 9010 captcha.
+    if (taskPlayAttempts >= 3) {
+      taskPlaySuppressedUntil = Date.now() + 30000;
+      taskPlayAttempts = 0;
+      reportStatus('video-task-waiting', {
+        message: '播放器连续暂停，已暂停自动恢复 30 秒；请直接点击视频播放。'
+      });
+      return false;
+    }
     // Only one task point may play at a time; pause the others when switching.
     for (const item of getVideoTaskStates(document)) {
       if (item.frame === frame) continue;
@@ -2728,6 +2764,12 @@
       if (!settings.muted && media.volume === 0) media.volume = 0.8;
       media.playbackRate = settings.rate;
       const result = media.play();
+      taskPlayAttempts += 1;
+      // A play that survives a few seconds means the helper is not fighting the
+      // player any more; allow future resumes for this task again.
+      window.setTimeout(() => {
+        if (media.isConnected && !media.paused) taskPlayAttempts = 0;
+      }, 6000);
       if (result && typeof result.catch === 'function') {
         result.catch((error) => {
           if (error?.name === 'NotAllowedError') {
