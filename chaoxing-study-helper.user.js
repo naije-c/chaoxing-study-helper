@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.20
+// @version      2.6.21
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -1121,8 +1121,10 @@
   }
 
   function videoPlaybackNeedsFocus() {
-    if (topControlsPlayback()) return false;
-    return settings.running && (multiVideoMode || hasMultipleVideoTaskFrames()) && !hasPlaybackFocus();
+    // Playback ownership (media-claim/media-owner) arbitrates which frame may
+    // play. Focus gating added a second, conflicting switch mechanism, so it is
+    // intentionally disabled; `task-focus` only boots the selected player.
+    return false;
   }
 
   // A non-selected child must not keep pausing a player that the site resumes:
@@ -1331,11 +1333,11 @@
       return;
     }
 
-    if (!forceOwned && mediaOwnerId !== MEDIA_FRAME_ID && !topControlsPlayback()) {
+    if (!forceOwned && mediaOwnerId !== MEDIA_FRAME_ID) {
       if (!mediaOwnerId) requestMediaOwnership();
       if (mediaOwnerId !== MEDIA_FRAME_ID) return;
     }
-    if (mediaOwnerId !== MEDIA_FRAME_ID && !topControlsPlayback()) return;
+    if (mediaOwnerId !== MEDIA_FRAME_ID) return;
 
     const reason = manualInterventionReason();
     if (reason) {
@@ -3010,9 +3012,8 @@
       .filter((candidate) => candidate.isConnected && !candidate.ended)
       .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
     if (!media) return false;
-    // Only one task point may play at a time; pause the others even when the
-    // selected media is already playing.
-    enforceSingleTaskPlayback(getVideoTaskStates(document));
+    // Ownership pauses other players; blocking them here caused a second
+    // pause/resume loop with the site.
     if (!media.paused) return false;
     // If the player keeps pausing right after our resume, stop fighting it:
     // that is what produced the pause/play storm and the 9010 captcha.
@@ -3097,9 +3098,7 @@
     selectedVideoTaskKey = item.key;
     selectedTaskSince = Date.now();
     lastVideoTaskFocusAt = Date.now();
-    // Pause other players once at selection time. Do not repeat this every tick:
-    // the site resumes its player and the pause/resume loop triggers 9010.
-    enforceSingleTaskPlayback(getVideoTaskStates(document));
+    // Ownership (media-owner) pauses the other players; no per-tick pausing here.
     multiVideoAdvanceSignature = '';
     sendTaskFocusMessages(item);
     keepTaskPlaying();
@@ -4113,6 +4112,7 @@
 
   start();
 })();
+
 
 
 
