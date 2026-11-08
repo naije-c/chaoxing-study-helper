@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.13
+// @version      2.6.14
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -253,6 +253,7 @@
   let selectedTaskSince = 0;
   let lastVerificationNoticeAt = 0;
   let lastAdoptAt = 0;
+  let lastEnforceLogAt = 0;
   // Anti-fight state: never let the helper and the site player toggle the same
   // media in a loop (that triggered Chaoxing's 9010 anti-abuse captcha).
   let taskMediaElement = null;
@@ -2661,13 +2662,19 @@
   // back-and-forth switching.
   function enforceSingleTaskPlayback(states) {
     if (!selectedVideoTaskFrame?.isConnected) return;
+    let paused = 0;
     for (const item of states) {
       if (item.frame === selectedVideoTaskFrame) continue;
       for (const media of mediaInsideFrame(item.frame)) {
         if (media.isConnected && !media.paused) {
-          try { media.pause(); } catch { /* Player lock. */ }
+          try { media.pause(); paused += 1; } catch { /* Player lock. */ }
         }
       }
+    }
+    const now = Date.now();
+    if (paused && now - lastEnforceLogAt > 2000) {
+      lastEnforceLogAt = now;
+      try { console.debug('[cx] pause non-selected players', paused); } catch {}
     }
   }
 
@@ -2872,6 +2879,7 @@
       reportStatus('video-task-selected', {
         message: `检测到你在播放${videoTaskLabel(item)}，已切换到此任务点。`
       });
+      try { console.debug('[cx] adopt', item.key, videoTaskLabel(item)); } catch {}
       return;
     }
   }
@@ -2964,6 +2972,7 @@
     reportStatus('video-task-selected', {
       message: `已选择未完成任务：${videoTaskLabel(item)}，正在等待视频开始…`
     });
+    try { console.debug('[cx] focus', item.key, videoTaskLabel(item)); } catch {}
     return true;
   }
 
@@ -3875,6 +3884,12 @@
 
     const boot = () => {
       if (!isSupportedSite()) return;
+      try {
+        const version = typeof GM_info !== 'undefined' && GM_info?.script?.version ? GM_info.script.version : '?';
+        console.info(`[cx-study-helper] v${version} ${location.host}${location.pathname}`);
+      } catch {
+        // Console access can be restricted.
+      }
       installCopyUnlock();
       scanMedia();
       if (isTop) coordinateVideoTasks();
@@ -3953,6 +3968,7 @@
 
   start();
 })();
+
 
 
 
