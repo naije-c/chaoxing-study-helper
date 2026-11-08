@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.14
+// @version      2.6.15
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -1589,7 +1589,10 @@
           selectedForThisFrame = taskFocusGranted;
         }
         multiVideoMode = Boolean(data.active);
-        topPlaybackControl = Boolean(data.active);
+        // Only the frame that actually owns the current task may play. Giving
+        // every child top-control made all players auto-start, and the top
+        // frame then had to pause them forever (visible video switching).
+        topPlaybackControl = Boolean(data.active) && selectedForThisFrame;
         if (data.resetFocus) taskFocusGranted = selectedForThisFrame;
         else if (selectedForThisFrame) taskFocusGranted = true;
         if (!multiVideoMode || !taskFocusGranted) {
@@ -3968,6 +3971,7 @@
 
   start();
 })();
+
 
 
 
