@@ -2,7 +2,7 @@
 
 面向超星学习通的 Tampermonkey 用户脚本，提供视频播放、复制粘贴限制解除、章节测验辅助和自动任务跳转等基础功能。
 
-![Version](https://img.shields.io/badge/version-2.6.24-blue)
+![Version](https://img.shields.io/badge/version-2.6.25-blue)
 ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-compatible-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -63,7 +63,7 @@
 https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js
 ```
 
-安装后请在 Tampermonkey 管理面板确认版本号为 **2.6.24**。
+安装后请在 Tampermonkey 管理面板确认版本号为 **2.6.25**。
 
 ## 更新脚本
 
@@ -200,7 +200,7 @@ i.chaoxing.com
 
 ### 视频不自动播放
 
-1. 先确认 Tampermonkey 里的版本是 **2.6.24**（更新后行为没变化多半是版本没更新）。
+1. 先确认 Tampermonkey 里的版本是 **2.6.25**（更新后行为没变化多半是版本没更新）。
 2. 刷新课程页面。
 3. 看面板提示：
    - "已选择未完成任务…正在等待视频开始"：播放器没有响应，手动点一下视频即可。
@@ -227,11 +227,12 @@ i.chaoxing.com
 - 2.6.22 记住本节已经播完的任务点；即使播放器 iframe 被站点替换或状态滞后，也不会再回选已完成的视频。
 - 2.6.23 参考 OCSJS 的做法：子 frame 不再自行播放/暂停，由顶层逐个任务点直接控制播放，避免多个 iframe 抢播放权。
 - 2.6.24 进一步按 OCSJS：选中任务在自己的 iframe 内播放（`task-play`），其他 frame 锁定，顶层不再直接操作播放器。
+- 2.6.25 按 OCSJS 重写为顶层顺序播放：每个 tick 只对当前任务点调用 `play`，暂停后 1.2 秒重试；子 frame 不再自动播放/暂停，已移除 owner/focus/block 仲裁。
 - 不要同时启用多个同类学习脚本。
 
 ### 全部任务点完成后不跳转
 
-- 确认版本是 **2.6.24**，旧版只处理"多视频且所有卡片都还在"的情况。
+- 确认版本是 **2.6.25**，旧版只处理"多视频且所有卡片都还在"的情况。
 - 2.6.11 起，平台同步滞后的任务点状态不会再覆盖页面上的"任务点已完成"标记。
 - 2.6.12 起，如果左侧目录里当前章节显示"已完成"，即使某个任务点状态滞后也会直接进入下一节。
 - 脚本不会在视频仍在播放时跳转；等当前视频结束。
@@ -290,6 +291,7 @@ git push
 ## License
 
 [MIT](LICENSE)
+
 
 
 

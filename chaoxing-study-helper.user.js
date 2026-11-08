@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.24
+// @version      2.6.25
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -261,6 +261,7 @@
   let verifyCooldownUntil = 0;
   let childPlaybackLocked = false;
   let directPlayGranted = false;
+  let lastSequentialPlayAt = 0;
   let selfFocusPauseTimes = [];
   let selfFocusPauseSuppressedUntil = 0;
   // Anti-fight state: never let the helper and the site player toggle the same
@@ -1349,7 +1350,7 @@
   }
 
   function tryPlay(forceOwned = false) {
-    if (childPlaybackLocked && !isTop) return;
+    if (!isTop) return;
     if (!settings.running || !currentMedia || !currentMedia.isConnected) return;
     if (currentMedia.ended) return;
     if (shouldSkipCompletedVideoTask() || videoPlaybackNeedsFocus()) {
@@ -1479,7 +1480,7 @@
   }
 
   function scanMedia() {
-    if (childPlaybackLocked && !isTop) return;
+    if (!isTop) return;
     if (settings.running && (shouldSkipCompletedVideoTask() || videoPlaybackNeedsFocus())) {
       if (!isTop && videoPlaybackNeedsFocus()) blockAllMediaPlayback();
       if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
@@ -3221,11 +3222,7 @@
 
   // The top frame is the single source of truth for which video task may play.
   function coordinateVideoTasks() {
-    if (!isTop) return;
-    if (!settings.running) {
-      if (selectedVideoTaskFrame) resetVideoTaskFocus();
-      return;
-    }
+    if (!isTop || !settings.running) return;
     if (Date.now() < automationGraceUntil) return;
     if (verificationCooldownActive()) {
       if (Date.now() - lastVerificationNoticeAt > 30000) {
@@ -3243,86 +3240,66 @@
     }
     if (pageBlockedByVerification()) {
       markVerificationCooldown();
-      if (selectedVideoTaskFrame) resetVideoTaskFocus();
-      taskPlaySuppressedUntil = Math.max(taskPlaySuppressedUntil, Date.now() + 60000);
+      for (const item of getVideoTaskStates(document)) {
+        for (const media of mediaInsideFrame(item.frame)) {
+          if (!media.paused) { try { media.pause(); } catch { /* Player lock. */ } }
+        }
+      }
       if (Date.now() - lastVerificationNoticeAt > 30000) {
         lastVerificationNoticeAt = Date.now();
         reportStatus('manual', { message: '检测到平台验证页（9010），已暂停自动操作，请手动完成验证码。' });
       }
       return;
     }
-    adoptManualTaskPlayback();
     if (videoAutoActionTimer) return;
 
     const states = getVideoTaskStates(document);
-    // No video task point on this page (text/quiz/discussion chapter): never
-    // treat "nothing pending" as "all videos done" and click next by itself.
-    if (!states.length) {
-      if (selectedVideoTaskFrame) resetVideoTaskFocus();
-      return;
-    }
-    const pending = states.filter((item) => item.state.known && !item.state.completed);
-    // Chapter-level completion wins over a stale per-frame pending state.
+    if (!states.length) return;
     if (currentChapterCompleted() && !anyTaskMediaPlaying(states)) {
-      resetVideoTaskFocus();
       scheduleMultiVideoAdvance(states);
       return;
     }
-    // The same coordinator handles single-video sections: after the only task
-    // completes there is nothing pending, and the advance path below must run.
-    const selectedPending = pending.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
-    if (selectedPending) {
-      videoTaskWaitSignature = '';
-      videoTaskWaitStartedAt = 0;
-      // Re-send the grant without dropping the selection: resetting it every 4s
-      // made other players look eligible and caused switching.
-      if (Date.now() - lastVideoTaskFocusAt > 4000) {
-        lastVideoTaskFocusAt = Date.now();
-        sendTaskFocusMessages(selectedPending);
-      } else {
-        scheduleTaskMediaResume(2500);
-      }
+
+    const pending = states.filter((item) => item.state.known && !item.state.completed);
+    if (!pending.length) {
+      if (anyTaskMediaPlaying(states)) return;
+      scheduleMultiVideoAdvance(states);
       return;
     }
 
-    // Keep the current task while it is playing (or was just chosen). The site
-    // may auto-start sibling players; switching to them is the switch storm.
-    const selectedItem = states.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
-    if (selectedItem) {
-      const completed = selectedItem.state.known && selectedItem.state.completed;
-      if (selectedTaskIsActive() || (!completed && Date.now() - selectedTaskSince < 20000)) {
-        scheduleTaskMediaResume(2500);
-        return;
-      }
-    }
+    // OCSJS-style sequential playback: only the current job's media is touched.
+    // No media-owner / focus / child-lock arbitration and no cross-frame pausing.
+    const item = pending.find((candidate) => candidate.frame === selectedVideoTaskFrame && candidate.key === selectedVideoTaskKey)
+      || pending[0];
+    selectedVideoTaskFrame = item.frame;
+    selectedVideoTaskKey = item.key;
+    selectedTaskSince = Date.now();
 
-    if (pending.length > 0) {
-      videoTaskWaitSignature = '';
-      videoTaskWaitStartedAt = 0;
-      focusVideoTask(pending[0]);
+    const media = mediaInsideFrame(item.frame)
+      .filter((candidate) => candidate.isConnected && !candidate.ended)
+      .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
+    if (!media) return;
+    if (media.ended) {
+      markTaskCompleted(item.key);
+      selectedVideoTaskFrame = null;
+      selectedVideoTaskKey = '';
       return;
     }
+    if (!media.paused) return;
 
-    const unknown = states.filter((item) => !item.state.known);
-    if (unknown.length > 0) {
-      if (selectedVideoTaskFrame) resetVideoTaskFocus();
-      // A still-playing video is an unfinished task point; do not skip it.
-      if (anyTaskMediaPlaying(states)) {
-        reportStatus('video-task-waiting', { message: '检测到视频仍在播放，等待其结束后再继续。' });
-        return;
-      }
-      if (scheduleUnknownTaskWait(unknown.length)) return;
+    const now = Date.now();
+    if (now - lastSequentialPlayAt < 1200) return;
+    lastSequentialPlayAt = now;
+    try {
+      media.muted = settings.muted;
+      if (!settings.muted && media.volume === 0) media.volume = 0.8;
+      media.playbackRate = settings.rate;
+      const result = media.play();
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+      reportStatus('playing');
+    } catch {
+      // Player was mid-reload; retry on the next tick.
     }
-
-    // Even when all markers say completed, a video the learner is still
-    // watching must finish before the section is left.
-    if (anyTaskMediaPlaying(states)) {
-      reportStatus('video-task-waiting', { message: '检测到视频仍在播放，等待其结束后再继续。' });
-      return;
-    }
-
-    resetVideoTaskFocus();
-    scheduleMultiVideoAdvance(states);
   }
 
   function probeMultiVideoTasks(attempt = 0) {
@@ -4102,7 +4079,6 @@
       automationGraceUntil = Date.now() + 3000;
       installPlayGuard();
       installCopyUnlock();
-      if (isTop) broadcastAction('child-lock');
       scanMedia();
       if (isTop) coordinateVideoTasks();
       ensurePanel();
@@ -4110,10 +4086,8 @@
       scanTimer = window.setInterval(() => {
         refreshSettingsFromStorage();
         maintainMediaOwnership();
-        if (isTop) broadcastAction('child-lock');
         scanMedia();
         if (isTop) coordinateVideoTasks();
-        if (isTop) syncFocusToChildren();
         ensurePanel();
         if (isTop) {
           broadcastAction('manual-check');
@@ -4181,6 +4155,7 @@
 
   start();
 })();
+
 
 
 
