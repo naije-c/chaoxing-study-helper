@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.12
+// @version      2.6.13
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -2656,6 +2656,21 @@
       .some((media) => media.isConnected && !media.paused && !media.ended));
   }
 
+  // Only the selected task point may play. The site often auto-starts several
+  // players; pausing them every tick is what actually stops the visible
+  // back-and-forth switching.
+  function enforceSingleTaskPlayback(states) {
+    if (!selectedVideoTaskFrame?.isConnected) return;
+    for (const item of states) {
+      if (item.frame === selectedVideoTaskFrame) continue;
+      for (const media of mediaInsideFrame(item.frame)) {
+        if (media.isConnected && !media.paused) {
+          try { media.pause(); } catch { /* Player lock. */ }
+        }
+      }
+    }
+  }
+
   // The platform's 9010 gate replaces the player document with an HTML captcha
   // page. All automation must stop until the learner clears it.
   function pageBlockedByVerification() {
@@ -2834,6 +2849,9 @@
     if (pageBlockedByVerification()) return;
     if (taskSwitchSuppressed()) return;
     if (!userGestureRecentlyActive()) return;
+    // While the selected task is actually playing, sibling auto-play must not
+    // pull the selection away. Pause the current video first to switch.
+    if (selectedTaskIsActive()) return;
     const now = Date.now();
     if (now - lastTaskSwitchAt < TASK_SWITCH_COOLDOWN_MS) return;
     // One adoption per 30s: two auto-playing players must not ping-pong the
@@ -2866,6 +2884,9 @@
       .filter((candidate) => candidate.isConnected && !candidate.ended)
       .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
     if (!media) return false;
+    // Only one task point may play at a time; pause the others even when the
+    // selected media is already playing.
+    enforceSingleTaskPlayback(getVideoTaskStates(document));
     if (!media.paused) return false;
     // If the player keeps pausing right after our resume, stop fighting it:
     // that is what produced the pause/play storm and the 9010 captcha.
@@ -2876,15 +2897,6 @@
         message: '播放器连续暂停，已暂停自动恢复 30 秒；请直接点击视频播放。'
       });
       return false;
-    }
-    // Only one task point may play at a time; pause the others when switching.
-    for (const item of getVideoTaskStates(document)) {
-      if (item.frame === frame) continue;
-      for (const other of mediaInsideFrame(item.frame)) {
-        if (!other.paused) {
-          try { other.pause(); } catch { /* Player lock. */ }
-        }
-      }
     }
     try {
       media.muted = settings.muted;
@@ -3030,6 +3042,7 @@
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       return;
     }
+    enforceSingleTaskPlayback(states);
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     // Chapter-level completion wins over a stale per-frame pending state.
     if (currentChapterCompleted() && !anyTaskMediaPlaying(states)) {
@@ -3100,6 +3113,7 @@
     if (pageBlockedByVerification()) return;
     const states = getVideoTaskStates(document);
     if (!states.length) return;
+    enforceSingleTaskPlayback(states);
     if (currentChapterCompleted() && !anyTaskMediaPlaying(states)) {
       continueAfterVideoTasks();
       return;
@@ -3939,6 +3953,7 @@
 
   start();
 })();
+
 
 
 

@@ -2,7 +2,7 @@
 
 面向超星学习通的 Tampermonkey 用户脚本，提供视频播放、复制粘贴限制解除、章节测验辅助和自动任务跳转等基础功能。
 
-![Version](https://img.shields.io/badge/version-2.6.12-blue)
+![Version](https://img.shields.io/badge/version-2.6.13-blue)
 ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-compatible-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -24,6 +24,7 @@
 - 你手动点了别的未完成视频时，脚本会跟随你的选择，不会拉回第一个
 - 同页面及跨 iframe 播放互斥，避免多个视频来回切换
 - 选片有冷却与切换风暴抑制，不会在多个视频之间反复跳
+- 只允许当前选中的任务点播放，其他自动拉起的播放器会被暂停
 - 检测到平台验证页（9010）时自动停止操作，等待手动完成验证
 - 打开页面时若本节视频已完成，自动打开章节测验或进入下一节
 - 检测到播放器反复暂停时主动退避，避免触发平台异常校验
@@ -62,7 +63,7 @@
 https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js
 ```
 
-安装后请在 Tampermonkey 管理面板确认版本号为 **2.6.12**。
+安装后请在 Tampermonkey 管理面板确认版本号为 **2.6.13**。
 
 ## 更新脚本
 
@@ -199,7 +200,7 @@ i.chaoxing.com
 
 ### 视频不自动播放
 
-1. 先确认 Tampermonkey 里的版本是 **2.6.12**（更新后行为没变化多半是版本没更新）。
+1. 先确认 Tampermonkey 里的版本是 **2.6.13**（更新后行为没变化多半是版本没更新）。
 2. 刷新课程页面。
 3. 看面板提示：
    - "已选择未完成任务…正在等待视频开始"：播放器没有响应，手动点一下视频即可。
@@ -221,7 +222,7 @@ i.chaoxing.com
 
 ### 全部任务点完成后不跳转
 
-- 确认版本是 **2.6.12**，旧版只处理"多视频且所有卡片都还在"的情况。
+- 确认版本是 **2.6.13**，旧版只处理"多视频且所有卡片都还在"的情况。
 - 2.6.11 起，平台同步滞后的任务点状态不会再覆盖页面上的"任务点已完成"标记。
 - 2.6.12 起，如果左侧目录里当前章节显示"已完成"，即使某个任务点状态滞后也会直接进入下一节。
 - 脚本不会在视频仍在播放时跳转；等当前视频结束。
@@ -280,6 +281,7 @@ git push
 ## License
 
 [MIT](LICENSE)
+
 
 
 
