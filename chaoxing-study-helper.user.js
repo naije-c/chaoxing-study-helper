@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.23
+// @version      2.6.24
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -260,6 +260,7 @@
   let automationGraceUntil = 0;
   let verifyCooldownUntil = 0;
   let childPlaybackLocked = false;
+  let directPlayGranted = false;
   let selfFocusPauseTimes = [];
   let selfFocusPauseSuppressedUntil = 0;
   // Anti-fight state: never let the helper and the site player toggle the same
@@ -1632,6 +1633,7 @@
     }
     if (data.action === 'child-lock') {
       if (!isTop) {
+        if (directPlayGranted) return;
         childPlaybackLocked = true;
         unblockAllMediaPlayback();
         for (const media of document.querySelectorAll('video,audio')) {
@@ -1644,13 +1646,31 @@
     }
     if (data.action === 'task-blur') {
       if (!isTop) {
-        if (childPlaybackLocked) return;
+        directPlayGranted = false;
         taskFocusGranted = false;
         topPlaybackControl = false;
         blockAllMediaPlayback();
         if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
         releaseMediaOwnership();
         sendToChildren(data);
+      }
+      return;
+    }
+    if (data.action === 'task-play') {
+      if (!isTop) {
+        directPlayGranted = true;
+        childPlaybackLocked = false;
+        multiVideoMode = true;
+        topPlaybackControl = true;
+        taskFocusGranted = true;
+        mediaOwnerId = MEDIA_FRAME_ID;
+        unblockAllMediaPlayback();
+        currentTaskStatusCheckedAt = 0;
+        sendToChildren({ ...data, inheritedFocus: true });
+        window.setTimeout(() => {
+          scanMedia();
+          tryPlay(true);
+        }, 0);
       }
       return;
     }
@@ -1689,16 +1709,18 @@
     }
     if (data.action === 'task-focus') {
       if (!isTop) {
-        if (childPlaybackLocked) return;
+        directPlayGranted = true;
+        childPlaybackLocked = false;
         multiVideoMode = true;
         topPlaybackControl = true;
         taskFocusGranted = true;
+        mediaOwnerId = MEDIA_FRAME_ID;
         unblockAllMediaPlayback();
         currentTaskStatusCheckedAt = 0;
         sendToChildren({ ...data, inheritedFocus: true });
         window.setTimeout(() => {
           scanMedia();
-          tryPlay();
+          tryPlay(true);
         }, 0);
       }
       return;
@@ -4159,6 +4181,7 @@
 
   start();
 })();
+
 
 
 
