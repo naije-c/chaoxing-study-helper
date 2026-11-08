@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.15
+// @version      2.6.16
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -55,6 +55,7 @@
   const SETTINGS_KEY = `${APP_ID}:settings`;
   const AI_SETTINGS_KEY = `${APP_ID}:ai-settings`;
   const AI_RUN_CACHE_KEY = `${APP_ID}:ai-run-cache`;
+  const VERIFY_COOLDOWN_KEY = `${APP_ID}:verify-cooldown`;
   const PANEL_ID = `${APP_ID}:panel`;
   const MESSAGE_KIND = `${APP_ID}:message`;
 
@@ -254,6 +255,8 @@
   let lastVerificationNoticeAt = 0;
   let lastAdoptAt = 0;
   let lastEnforceLogAt = 0;
+  let automationGraceUntil = 0;
+  let verifyCooldownUntil = 0;
   // Anti-fight state: never let the helper and the site player toggle the same
   // media in a loop (that triggered Chaoxing's 9010 anti-abuse captcha).
   let taskMediaElement = null;
@@ -2681,6 +2684,19 @@
     }
   }
 
+  // After a 9010 gate, stay quiet for a few minutes: hammering the same page
+  // only extends the platform's risk-control window.
+  function verificationCooldownActive() {
+    const until = Number(verifyCooldownUntil || gmGet(VERIFY_COOLDOWN_KEY, 0) || 0);
+    return Date.now() < until;
+  }
+
+  function markVerificationCooldown() {
+    const until = Date.now() + 3 * 60 * 1000;
+    verifyCooldownUntil = until;
+    gmSet(VERIFY_COOLDOWN_KEY, until);
+  }
+
   // The platform's 9010 gate replaces the player document with an HTML captcha
   // page. All automation must stop until the learner clears it.
   function pageBlockedByVerification() {
@@ -2780,11 +2796,13 @@
   // stalled. Returns true when a resume attempt was actually issued.
   function scheduleTaskMediaResume(delay = 2500) {
     if (!isTop || !settings.running || !selectedVideoTaskFrame?.isConnected) return false;
+    if (Date.now() < automationGraceUntil || verificationCooldownActive()) return false;
     if (pageBlockedByVerification() || currentChapterCompleted()) return false;
     if (taskPlaybackSuppressed() || taskPlayResumeTimer) return false;
     taskPlayResumeTimer = window.setTimeout(() => {
       taskPlayResumeTimer = 0;
       if (!settings.running || !selectedVideoTaskFrame?.isConnected || taskPlaybackSuppressed()) return;
+      if (Date.now() < automationGraceUntil || verificationCooldownActive()) return;
       if (pageBlockedByVerification() || currentChapterCompleted()) return;
       const media = mediaInsideFrame(selectedVideoTaskFrame)
         .filter((candidate) => candidate.isConnected && !candidate.ended)
@@ -2889,6 +2907,7 @@
 
   function directPlayTaskMedia(frame) {
     if (!isTop || !frame) return false;
+    if (Date.now() < automationGraceUntil || verificationCooldownActive()) return false;
     if (pageBlockedByVerification() || currentChapterCompleted()) return false;
     if (taskPlaybackSuppressed()) return false;
     const media = mediaInsideFrame(frame)
@@ -3028,6 +3047,14 @@
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       return;
     }
+    if (Date.now() < automationGraceUntil) return;
+    if (verificationCooldownActive()) {
+      if (Date.now() - lastVerificationNoticeAt > 30000) {
+        lastVerificationNoticeAt = Date.now();
+        reportStatus('manual', { message: '平台验证冷却中，请完成验证码并等待几分钟后再继续。' });
+      }
+      return;
+    }
     const pageSignature = `${location.pathname}|${location.search}|${currentChapterMarker()}`;
     if (pageSignature !== taskPageSignature) {
       taskPageSignature = pageSignature;
@@ -3036,6 +3063,7 @@
       taskSwitchSuppressedUntil = 0;
     }
     if (pageBlockedByVerification()) {
+      markVerificationCooldown();
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       taskPlaySuppressedUntil = Math.max(taskPlaySuppressedUntil, Date.now() + 60000);
       if (Date.now() - lastVerificationNoticeAt > 30000) {
@@ -3893,6 +3921,8 @@
       } catch {
         // Console access can be restricted.
       }
+      verifyCooldownUntil = Number(gmGet(VERIFY_COOLDOWN_KEY, 0) || 0);
+      automationGraceUntil = Date.now() + 3000;
       installCopyUnlock();
       scanMedia();
       if (isTop) coordinateVideoTasks();
@@ -3971,6 +4001,7 @@
 
   start();
 })();
+
 
 
 
