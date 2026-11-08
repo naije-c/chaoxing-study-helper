@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.3
+// @version      2.6.4
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -926,6 +926,31 @@
     }
   }
 
+  function ownVideoModule(frame) {
+    return /\/ananas\/modules\/video|modules\/video\/index\.html/i.test(
+      String(frame?.getAttribute?.('src') || frame?.src || '')
+    );
+  }
+
+  // Task points can live inside a same-origin content iframe (mooc-ans cards),
+  // so the walk must enter those documents. Player frames nested inside a task
+  // iframe must never be counted as task points, though.
+  function isPlayerNestedInTaskFrame(frame) {
+    try {
+      let doc = frame?.ownerDocument;
+      for (let depth = 0; doc && depth < 6; depth++) {
+        const view = doc.defaultView;
+        const host = view?.frameElement;
+        if (!host) return false;
+        if (ownVideoModule(host)) return true;
+        doc = host.ownerDocument;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
   function videoTaskFrames(doc = document) {
     const result = [];
     const seenDocs = new Set();
@@ -933,27 +958,22 @@
       if (!root || seenDocs.has(root) || depth > 7) return;
       seenDocs.add(root);
       for (const frame of Array.from(root.querySelectorAll('iframe'))) {
-        let hasInlineMedia = false;
+        let innerDoc = null;
         try {
-          hasInlineMedia = Boolean(frame.contentDocument?.querySelector('video,audio'));
+          innerDoc = frame.contentDocument || null;
         } catch {
-          // Cross-origin child frame.
+          innerDoc = null;
         }
-        const ownTaskModule = /\/ananas\/modules\/video|modules\/video\/index\.html/i.test(
-          String(frame.getAttribute('src') || frame.src || '')
-        );
-        // A frame inside another frame's document is a player when its host
-        // iframe is itself the video task module: counting it would add a
-        // phantom task point ("第 1 个视频任务点" + a task that never completes).
-        let nestedInTaskFrame = false;
-        if (root !== doc) {
-          const host = hostFrameElementOf(root);
-          nestedInTaskFrame = Boolean(host && /video|ananas/i.test(String(host.getAttribute('src') || host.src || '')));
-        }
-        const isTaskPoint = hasInlineMedia || (root === doc ? isTaskCandidateFrame(frame) : ownTaskModule && !nestedInTaskFrame);
-        if (isTaskPoint) result.push(frame);
+        // Task points can live inside a same-origin content iframe, but a
+        // player frame nested inside a task iframe must not be counted: that
+        // phantom task point used to block autoplay forever.
+        const isTaskFrame = !isPlayerNestedInTaskFrame(frame)
+          && (ownVideoModule(frame)
+            || isTaskCandidateFrame(frame)
+            || Boolean(innerDoc?.querySelector('video,audio')));
+        if (isTaskFrame) result.push(frame);
         try {
-          if (frame.contentDocument) walk(frame.contentDocument, depth + 1);
+          if (innerDoc) walk(innerDoc, depth + 1);
         } catch {
           // Cross-origin child frame.
         }
