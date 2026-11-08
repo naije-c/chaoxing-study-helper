@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.4
+// @version      2.6.5
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -240,6 +240,8 @@
   let backgroundResumeTimer = 0;
   let backgroundResumeAttempts = 0;
   let backgroundInterruptedAt = 0;
+  let taskPlayTimer = 0;
+  let taskPlayAttempts = 0;
   const seenCommands = new Set();
 
   const isTop = (() => {
@@ -2567,10 +2569,104 @@
     return item?.state?.label || `第 ${Number(item?.index || 0) + 1} 个视频任务点`;
   }
 
+  // Same-origin task iframes (ananas video modules) expose their <video> to the
+  // top frame. Driving it directly makes autoplay work even when the player's
+  // own script missed the focus message, which is the common failure on
+  // multi-card chapters.
+  function mediaInsideFrame(frame) {
+    const list = [];
+    try {
+      const doc = frame?.contentDocument;
+      if (!doc) return list;
+      for (const media of doc.querySelectorAll('video,audio')) list.push(media);
+      for (const nested of Array.from(doc.querySelectorAll('iframe'))) {
+        try {
+          const nestedDoc = nested.contentDocument;
+          if (!nestedDoc) continue;
+          for (const media of nestedDoc.querySelectorAll('video,audio')) list.push(media);
+        } catch {
+          // Cross-origin nested player.
+        }
+      }
+    } catch {
+      // Cross-origin task frame.
+    }
+    return list;
+  }
+
+  function directPlayTaskMedia(frame) {
+    if (!isTop || !frame) return false;
+    const media = mediaInsideFrame(frame)
+      .filter((candidate) => candidate.isConnected && !candidate.ended)
+      .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
+    if (!media) return false;
+    // Only one task point may play at a time.
+    for (const item of getVideoTaskStates(document)) {
+      if (item.frame === frame) continue;
+      for (const other of mediaInsideFrame(item.frame)) {
+        if (!other.paused) {
+          try { other.pause(); } catch { /* Player lock. */ }
+        }
+      }
+    }
+    try {
+      media.muted = settings.muted;
+      if (!settings.muted && media.volume === 0) media.volume = 0.8;
+      media.playbackRate = settings.rate;
+      const result = media.play();
+      if (result && typeof result.catch === 'function') {
+        result.catch((error) => {
+          if (error?.name === 'NotAllowedError') {
+            reportStatus('blocked', { message: '浏览器阻止了自动播放，请点一下视频或“暂停/开始”按钮' });
+          }
+        });
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function keepTaskPlaying() {
+    if (taskPlayTimer) return;
+    taskPlayAttempts = 0;
+    const tick = () => {
+      taskPlayTimer = 0;
+      if (!isTop || !settings.running || !selectedVideoTaskFrame?.isConnected) return;
+      if (taskPlayAttempts >= 40) return;
+      const state = getVideoTaskStates(document)
+        .find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
+      if (!state || state.state.completed) return;
+      const media = mediaInsideFrame(selectedVideoTaskFrame).filter((candidate) => candidate.isConnected && !candidate.ended);
+      if (media.length && media.every((candidate) => !candidate.paused)) {
+        taskPlayAttempts = 0;
+        taskPlayTimer = window.setTimeout(tick, 2000);
+        return;
+      }
+      taskPlayAttempts += 1;
+      directPlayTaskMedia(selectedVideoTaskFrame);
+      taskPlayTimer = window.setTimeout(tick, 1200);
+    };
+    taskPlayTimer = window.setTimeout(tick, 300);
+  }
+
+  // Runs on every scan tick: keeps the selected task playing even when the
+  // player frame's own autoplay/visibility handling failed.
+  function coordinateSelectedTaskPlayback() {
+    if (!isTop || !settings.running || !selectedVideoTaskFrame?.isConnected) return;
+    const media = mediaInsideFrame(selectedVideoTaskFrame).filter((candidate) => candidate.isConnected && !candidate.ended);
+    if (!media.length) return;
+    if (media.every((candidate) => !candidate.paused)) return;
+    directPlayTaskMedia(selectedVideoTaskFrame);
+  }
+
   function resetVideoTaskFocus() {
     selectedVideoTaskFrame = null;
     selectedVideoTaskKey = '';
     lastVideoTaskFocusAt = 0;
+    taskPlayAttempts = 0;
+    clearTimeout(taskPlayTimer);
+    taskPlayTimer = 0;
     if (!isTop) return;
     sendToChildren({
       kind: MESSAGE_KIND,
@@ -2602,6 +2698,7 @@
       action: 'task-focus',
       taskKey: item.key
     });
+    keepTaskPlaying();
     reportStatus('video-task-selected', {
       message: `已选择未完成任务：${videoTaskLabel(item)}，正在等待视频开始…`
     });
@@ -2657,14 +2754,18 @@
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       return;
     }
-    if (!isMultiVideoTaskPage()) {
-      if (selectedVideoTaskFrame) resetVideoTaskFocus();
-      return;
-    }
     if (videoAutoActionTimer) return;
 
     const states = getVideoTaskStates(document);
     const pending = states.filter((item) => item.state.known && !item.state.completed);
+    // Even a single-video section goes through the same selection so the top
+    // frame can start the same-origin player directly; the message handshake
+    // alone is not reliable on every player build.
+    if (!isMultiVideoTaskPage() && !pending.length) {
+      if (selectedVideoTaskFrame) resetVideoTaskFocus();
+      return;
+    }
+
     const selectedPending = pending.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
     if (selectedPending) {
       videoTaskWaitSignature = '';
@@ -2675,6 +2776,8 @@
         selectedVideoTaskFrame = null;
         selectedVideoTaskKey = '';
         focusVideoTask(selectedPending);
+      } else if (!taskPlayTimer) {
+        keepTaskPlaying();
       }
       return;
     }
@@ -2683,6 +2786,11 @@
       videoTaskWaitSignature = '';
       videoTaskWaitStartedAt = 0;
       focusVideoTask(pending[0]);
+      return;
+    }
+
+    if (!isMultiVideoTaskPage()) {
+      if (selectedVideoTaskFrame) resetVideoTaskFocus();
       return;
     }
 
@@ -2704,7 +2812,6 @@
   function probeMultiVideoTasks(attempt = 0) {
     videoAutoActionTimer = 0;
     if (!settings.running || !isTop) return;
-    if (!isMultiVideoTaskPage()) return;
     const states = getVideoTaskStates(document);
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     if (pending.length > 0) {
@@ -3517,6 +3624,9 @@
         scanMedia();
         if (isTop) coordinateVideoTasks();
         if (isTop) syncFocusToChildren();
+        // While running, top-level playback must survive platform pauses and
+        // hidden tabs even when the player frame's own script is inactive.
+        if (isTop && settings.running) coordinateSelectedTaskPlayback();
         ensurePanel();
         if (isTop) {
           broadcastAction('manual-check');
@@ -3541,6 +3651,7 @@
           if (settings.running) {
             // Re-apply playback settings after the platform restored its UI.
             window.setTimeout(tryPlay, 400);
+            if (isTop && selectedVideoTaskFrame) keepTaskPlaying();
           }
         }, 200);
       });

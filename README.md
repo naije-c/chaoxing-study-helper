@@ -2,7 +2,7 @@
 
 面向超星学习通的 Tampermonkey 用户脚本，提供视频播放、复制粘贴限制解除、章节测验辅助和自动任务跳转等基础功能。
 
-![Version](https://img.shields.io/badge/version-2.6.4-blue)
+![Version](https://img.shields.io/badge/version-2.6.5-blue)
 ![Tampermonkey](https://img.shields.io/badge/Tampermonkey-compatible-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
