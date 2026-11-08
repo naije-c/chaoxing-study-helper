@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.9
+// @version      2.6.10
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -250,6 +250,9 @@
   let taskSwitchTimes = [];
   let taskSwitchSuppressedUntil = 0;
   let taskPageSignature = '';
+  let selectedTaskSince = 0;
+  let lastVerificationNoticeAt = 0;
+  let lastAdoptAt = 0;
   // Anti-fight state: never let the helper and the site player toggle the same
   // media in a loop (that triggered Chaoxing's 9010 anti-abuse captcha).
   let taskMediaElement = null;
@@ -2650,6 +2653,40 @@
       .some((media) => media.isConnected && !media.paused && !media.ended));
   }
 
+  // The platform's 9010 gate replaces the player document with an HTML captcha
+  // page. All automation must stop until the learner clears it.
+  function pageBlockedByVerification() {
+    const pattern = /9010|操作异常|antispider/i;
+    try {
+      if (pattern.test(document.body?.innerText || '')) return true;
+    } catch {
+      // Ignore a detached document.
+    }
+    for (const frame of document.querySelectorAll('iframe')) {
+      try {
+        const doc = frame.contentDocument;
+        if (!doc) continue;
+        if (pattern.test(doc.body?.innerText || '')) return true;
+        if (/antispiderShowVerify/i.test(String(frame.getAttribute('src') || ''))) return true;
+      } catch {
+        // Cross-origin frame.
+      }
+    }
+    return false;
+  }
+
+  // Once a task point is selected it owns playback until it ends, or until the
+  // learner explicitly picks another one. This blocks the site's auto-played
+  // sibling players from pulling the selection around.
+  function selectedTaskIsActive() {
+    if (!selectedVideoTaskFrame?.isConnected) return false;
+    return mediaInsideFrame(selectedVideoTaskFrame).some((media) => {
+      if (!media.isConnected || media.ended) return false;
+      if (!media.paused) return true;
+      return Number(media.currentTime) > 0.5;
+    });
+  }
+
   function taskPlaybackSuppressed() {
     return Date.now() < taskPlaySuppressedUntil;
   }
@@ -2698,10 +2735,12 @@
   // stalled. Returns true when a resume attempt was actually issued.
   function scheduleTaskMediaResume(delay = 2500) {
     if (!isTop || !settings.running || !selectedVideoTaskFrame?.isConnected) return false;
+    if (pageBlockedByVerification()) return false;
     if (taskPlaybackSuppressed() || taskPlayResumeTimer) return false;
     taskPlayResumeTimer = window.setTimeout(() => {
       taskPlayResumeTimer = 0;
       if (!settings.running || !selectedVideoTaskFrame?.isConnected || taskPlaybackSuppressed()) return;
+      if (pageBlockedByVerification()) return;
       const media = mediaInsideFrame(selectedVideoTaskFrame)
         .filter((candidate) => candidate.isConnected && !candidate.ended)
         .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
@@ -2772,17 +2811,23 @@
 
   function adoptManualTaskPlayback() {
     if (!isTop || !settings.running) return;
+    if (pageBlockedByVerification()) return;
     if (taskSwitchSuppressed()) return;
     if (!userGestureRecentlyActive()) return;
     const now = Date.now();
     if (now - lastTaskSwitchAt < TASK_SWITCH_COOLDOWN_MS) return;
+    // One adoption per 30s: two auto-playing players must not ping-pong the
+    // selection back and forth.
+    if (now - lastAdoptAt < TASK_SWITCH_SUPPRESS_MS) return;
     for (const item of getVideoTaskStates(document)) {
       if (item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey) continue;
       const playing = mediaInsideFrame(item.frame).find((media) => media.isConnected && !media.paused && !media.ended);
       if (!playing) continue;
       selectedVideoTaskFrame = item.frame;
       selectedVideoTaskKey = item.key;
+      selectedTaskSince = now;
       lastVideoTaskFocusAt = now;
+      lastAdoptAt = now;
       multiVideoAdvanceSignature = '';
       taskPlayAttempts = 0;
       noteTaskSwitch();
@@ -2795,6 +2840,7 @@
 
   function directPlayTaskMedia(frame) {
     if (!isTop || !frame) return false;
+    if (pageBlockedByVerification()) return false;
     if (taskPlaybackSuppressed()) return false;
     const media = mediaInsideFrame(frame)
       .filter((candidate) => candidate.isConnected && !candidate.ended)
@@ -2847,6 +2893,7 @@
   function resetVideoTaskFocus() {
     selectedVideoTaskFrame = null;
     selectedVideoTaskKey = '';
+    selectedTaskSince = 0;
     lastVideoTaskFocusAt = 0;
     taskPlayAttempts = 0;
     clearTimeout(taskPlayTimer);
@@ -2872,12 +2919,11 @@
       sendTaskFocusMessages(item);
       return true;
     }
-    if (selectedVideoTaskFrame?.isConnected) {
-      if (taskSwitchSuppressed()) return false;
-      if (Date.now() - lastTaskSwitchAt < TASK_SWITCH_COOLDOWN_MS) return false;
-    }
+    if (taskSwitchSuppressed()) return false;
+    if (lastTaskSwitchAt && Date.now() - lastTaskSwitchAt < TASK_SWITCH_COOLDOWN_MS) return false;
     selectedVideoTaskFrame = item.frame;
     selectedVideoTaskKey = item.key;
+    selectedTaskSince = Date.now();
     lastVideoTaskFocusAt = Date.now();
     multiVideoAdvanceSignature = '';
     sendTaskFocusMessages(item);
@@ -2945,6 +2991,15 @@
       lastTaskSwitchAt = 0;
       taskSwitchSuppressedUntil = 0;
     }
+    if (pageBlockedByVerification()) {
+      if (selectedVideoTaskFrame) resetVideoTaskFocus();
+      taskPlaySuppressedUntil = Math.max(taskPlaySuppressedUntil, Date.now() + 60000);
+      if (Date.now() - lastVerificationNoticeAt > 30000) {
+        lastVerificationNoticeAt = Date.now();
+        reportStatus('manual', { message: '检测到平台验证页（9010），已暂停自动操作，请手动完成验证码。' });
+      }
+      return;
+    }
     adoptManualTaskPlayback();
     if (videoAutoActionTimer) return;
 
@@ -2973,13 +3028,15 @@
       return;
     }
 
-    // The selected task's marker may be unreadable for a moment, but if its
-    // video is still playing the learner is watching it: never switch away.
+    // Keep the current task while it is playing (or was just chosen). The site
+    // may auto-start sibling players; switching to them is the switch storm.
     const selectedItem = states.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
-    if (selectedItem && !selectedItem.state.known
-      && mediaInsideFrame(selectedItem.frame).some((media) => media.isConnected && !media.paused && !media.ended)) {
-      scheduleTaskMediaResume(2500);
-      return;
+    if (selectedItem) {
+      const completed = selectedItem.state.known && selectedItem.state.completed;
+      if (selectedTaskIsActive() || (!completed && Date.now() - selectedTaskSince < 20000)) {
+        scheduleTaskMediaResume(2500);
+        return;
+      }
     }
 
     if (pending.length > 0) {
@@ -3014,8 +3071,17 @@
   function probeMultiVideoTasks(attempt = 0) {
     videoAutoActionTimer = 0;
     if (!settings.running || !isTop) return;
+    if (pageBlockedByVerification()) return;
     const states = getVideoTaskStates(document);
     if (!states.length) return;
+    const selectedItem = states.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
+    if (selectedItem) {
+      const completed = selectedItem.state.known && selectedItem.state.completed;
+      if (selectedTaskIsActive() || (!completed && Date.now() - selectedTaskSince < 20000)) {
+        sendTaskFocusMessages(selectedItem);
+        return;
+      }
+    }
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     if (pending.length > 0) {
       focusVideoTask(pending[0]);
@@ -3843,5 +3909,6 @@
 
   start();
 })();
+
 
 
