@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.10
+// @version      2.6.11
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -910,20 +910,23 @@
   function readTaskStateFromFrameElement(frame) {
     if (!frame) return { known: false, completed: false, taskPoint: false };
     const attachmentState = readAttachmentTaskState(frame);
-    if (attachmentState) return attachmentState;
-
     const ownContainer = outerTaskContainer(frame);
     const own = taskStateFromContainer(ownContainer);
-    if (own) return own;
-
-    const shared = taskContainerWithOtherVideoFrames(frame);
-    if (shared) {
-      const sharedState = taskStateFromContainer(shared);
-      if (sharedState) return sharedState;
-    }
-
+    const sharedContainer = taskContainerWithOtherVideoFrames(frame);
+    const shared = sharedContainer ? taskStateFromContainer(sharedContainer) : null;
     const marker = completedMarkerNear(frame);
-    if (marker) return marker;
+    const finished = mediaFinishedInFrame(frame);
+    const label = attachmentState?.label || own?.label || '';
+
+    // Strong completed evidence wins over a stale attachment flag: Chaoxing's
+    // attachment.job often stays true until the server syncs, and trusting it
+    // makes finished videos look pending (replayed / never advancing).
+    if (finished || own?.completed || shared?.completed || marker?.completed || attachmentState?.completed) {
+      return { known: true, completed: true, taskPoint: true, label };
+    }
+    if (attachmentState) return { ...attachmentState, label };
+    if (own) return own;
+    if (shared) return shared;
 
     // Last resort: a task point that is visibly "任务点" but carries no state
     // marker is treated as pending, which keeps playback conservative.
@@ -3909,6 +3912,7 @@
 
   start();
 })();
+
 
 
 
