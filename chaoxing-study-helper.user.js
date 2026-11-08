@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.11
+// @version      2.6.12
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -2678,6 +2678,23 @@
     return false;
   }
 
+  // The course tree marks the current chapter as completed once all of its
+  // task points are done. This is a global signal that outranks a stale
+  // per-frame attachment/marker, which otherwise keeps the section pending.
+  function currentChapterCompleted() {
+    try {
+      const active = document.querySelector('#coursetree .posCatalog_active')
+        || document.querySelector('#coursetree .posCatalog_select.posCatalog_active');
+      if (!active) return false;
+      const item = active.closest?.('li') || active;
+      const text = String(item.innerText || item.textContent || '');
+      if (/已完成/.test(text)) return true;
+      return Boolean(item.querySelector('.icon_Completed, .task-point-completed, [class*="Completed"], [class*="completed"]'));
+    } catch {
+      return false;
+    }
+  }
+
   // Once a task point is selected it owns playback until it ends, or until the
   // learner explicitly picks another one. This blocks the site's auto-played
   // sibling players from pulling the selection around.
@@ -2738,12 +2755,12 @@
   // stalled. Returns true when a resume attempt was actually issued.
   function scheduleTaskMediaResume(delay = 2500) {
     if (!isTop || !settings.running || !selectedVideoTaskFrame?.isConnected) return false;
-    if (pageBlockedByVerification()) return false;
+    if (pageBlockedByVerification() || currentChapterCompleted()) return false;
     if (taskPlaybackSuppressed() || taskPlayResumeTimer) return false;
     taskPlayResumeTimer = window.setTimeout(() => {
       taskPlayResumeTimer = 0;
       if (!settings.running || !selectedVideoTaskFrame?.isConnected || taskPlaybackSuppressed()) return;
-      if (pageBlockedByVerification()) return;
+      if (pageBlockedByVerification() || currentChapterCompleted()) return;
       const media = mediaInsideFrame(selectedVideoTaskFrame)
         .filter((candidate) => candidate.isConnected && !candidate.ended)
         .sort((a, b) => mediaArea(b) - mediaArea(a))[0];
@@ -2843,7 +2860,7 @@
 
   function directPlayTaskMedia(frame) {
     if (!isTop || !frame) return false;
-    if (pageBlockedByVerification()) return false;
+    if (pageBlockedByVerification() || currentChapterCompleted()) return false;
     if (taskPlaybackSuppressed()) return false;
     const media = mediaInsideFrame(frame)
       .filter((candidate) => candidate.isConnected && !candidate.ended)
@@ -3014,6 +3031,12 @@
       return;
     }
     const pending = states.filter((item) => item.state.known && !item.state.completed);
+    // Chapter-level completion wins over a stale per-frame pending state.
+    if (currentChapterCompleted() && !anyTaskMediaPlaying(states)) {
+      resetVideoTaskFocus();
+      scheduleMultiVideoAdvance(states);
+      return;
+    }
     // The same coordinator handles single-video sections: after the only task
     // completes there is nothing pending, and the advance path below must run.
     const selectedPending = pending.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
@@ -3077,6 +3100,10 @@
     if (pageBlockedByVerification()) return;
     const states = getVideoTaskStates(document);
     if (!states.length) return;
+    if (currentChapterCompleted() && !anyTaskMediaPlaying(states)) {
+      continueAfterVideoTasks();
+      return;
+    }
     const selectedItem = states.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
     if (selectedItem) {
       const completed = selectedItem.state.known && selectedItem.state.completed;
@@ -3912,6 +3939,7 @@
 
   start();
 })();
+
 
 
 
