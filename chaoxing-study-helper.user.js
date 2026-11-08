@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.16
+// @version      2.6.17
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -257,6 +257,8 @@
   let lastEnforceLogAt = 0;
   let automationGraceUntil = 0;
   let verifyCooldownUntil = 0;
+  let selfFocusPauseTimes = [];
+  let selfFocusPauseSuppressedUntil = 0;
   // Anti-fight state: never let the helper and the site player toggle the same
   // media in a loop (that triggered Chaoxing's 9010 anti-abuse captcha).
   let taskMediaElement = null;
@@ -1123,6 +1125,23 @@
     return settings.running && (multiVideoMode || hasMultipleVideoTaskFrames()) && !hasPlaybackFocus();
   }
 
+  // A non-selected child must not keep pausing a player that the site resumes:
+  // that pause/resume loop is what triggers the 9010 gate. After a few attempts
+  // it stops fighting for a minute.
+  function childSelfPauseSuppressed() {
+    if (isTop) return false;
+    const now = Date.now();
+    if (now < selfFocusPauseSuppressedUntil) return true;
+    selfFocusPauseTimes = selfFocusPauseTimes.filter((at) => now - at < 12000);
+    selfFocusPauseTimes.push(now);
+    if (selfFocusPauseTimes.length > 3) {
+      selfFocusPauseSuppressedUntil = now + 60000;
+      selfFocusPauseTimes = [];
+      return true;
+    }
+    return false;
+  }
+
   // A chapter can be swapped without a page load, so the top frame re-applies
   // its current decision instead of relying on a frame keeping its state.
   function syncFocusToChildren(force = false) {
@@ -1306,6 +1325,7 @@
     if (!settings.running || !currentMedia || !currentMedia.isConnected) return;
     if (currentMedia.ended) return;
     if (shouldSkipCompletedVideoTask() || videoPlaybackNeedsFocus()) {
+      if (!isTop && videoPlaybackNeedsFocus() && childSelfPauseSuppressed()) return;
       try { currentMedia.pause(); } catch {}
       releaseMediaOwnership();
       return;
@@ -1431,6 +1451,7 @@
 
   function scanMedia() {
     if (settings.running && (shouldSkipCompletedVideoTask() || videoPlaybackNeedsFocus())) {
+      if (!isTop && videoPlaybackNeedsFocus() && childSelfPauseSuppressed()) return;
       if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
       for (const media of document.querySelectorAll('video,audio')) {
         if (!media.paused) { try { media.pause(); } catch {} }
@@ -2668,10 +2689,16 @@
   // back-and-forth switching.
   function enforceSingleTaskPlayback(states) {
     if (!selectedVideoTaskFrame?.isConnected) return;
+    // The same <video> can be reachable through both the task iframe and a
+    // nested player iframe. Never pause an element that belongs to the
+    // selected task: doing so paused the video we were watching, the site
+    // resumed it, and the loop looked like "switching".
+    const selectedMedia = new Set(mediaInsideFrame(selectedVideoTaskFrame));
     let paused = 0;
     for (const item of states) {
       if (item.frame === selectedVideoTaskFrame) continue;
       for (const media of mediaInsideFrame(item.frame)) {
+        if (selectedMedia.has(media)) continue;
         if (media.isConnected && !media.paused) {
           try { media.pause(); paused += 1; } catch { /* Player lock. */ }
         }
@@ -2987,6 +3014,9 @@
     selectedVideoTaskKey = item.key;
     selectedTaskSince = Date.now();
     lastVideoTaskFocusAt = Date.now();
+    // Pause other players once at selection time. Do not repeat this every tick:
+    // the site resumes its player and the pause/resume loop triggers 9010.
+    enforceSingleTaskPlayback(getVideoTaskStates(document));
     multiVideoAdvanceSignature = '';
     sendTaskFocusMessages(item);
     keepTaskPlaying();
@@ -3082,7 +3112,6 @@
       if (selectedVideoTaskFrame) resetVideoTaskFocus();
       return;
     }
-    enforceSingleTaskPlayback(states);
     const pending = states.filter((item) => item.state.known && !item.state.completed);
     // Chapter-level completion wins over a stale per-frame pending state.
     if (currentChapterCompleted() && !anyTaskMediaPlaying(states)) {
@@ -3153,7 +3182,6 @@
     if (pageBlockedByVerification()) return;
     const states = getVideoTaskStates(document);
     if (!states.length) return;
-    enforceSingleTaskPlayback(states);
     if (currentChapterCompleted() && !anyTaskMediaPlaying(states)) {
       continueAfterVideoTasks();
       return;
@@ -4001,6 +4029,7 @@
 
   start();
 })();
+
 
 
 
