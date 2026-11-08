@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.17
+// @version      2.6.18
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -1451,7 +1451,7 @@
 
   function scanMedia() {
     if (settings.running && (shouldSkipCompletedVideoTask() || videoPlaybackNeedsFocus())) {
-      if (!isTop && videoPlaybackNeedsFocus() && childSelfPauseSuppressed()) return;
+      if (!isTop && videoPlaybackNeedsFocus()) blockAllMediaPlayback();
       if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
       for (const media of document.querySelectorAll('video,audio')) {
         if (!media.paused) { try { media.pause(); } catch {} }
@@ -1620,9 +1620,11 @@
         if (data.resetFocus) taskFocusGranted = selectedForThisFrame;
         else if (selectedForThisFrame) taskFocusGranted = true;
         if (!multiVideoMode || !taskFocusGranted) {
+          blockAllMediaPlayback();
           if (currentMedia && !currentMedia.paused) { try { currentMedia.pause(); } catch {} }
           releaseMediaOwnership();
         } else {
+          unblockAllMediaPlayback();
           currentTaskStatusCheckedAt = 0;
           window.setTimeout(() => {
             scanMedia();
@@ -1638,6 +1640,7 @@
         multiVideoMode = true;
         topPlaybackControl = true;
         taskFocusGranted = true;
+        unblockAllMediaPlayback();
         currentTaskStatusCheckedAt = 0;
         sendToChildren({ ...data, inheritedFocus: true });
         window.setTimeout(() => {
@@ -2676,6 +2679,40 @@
     return list;
   }
 
+  // Pausing a non-selected player is not enough: the site resumes it and the
+  // pause/resume loop triggers 9010. Blocking its play() is what actually stops
+  // it; the block is removed as soon as that frame becomes the selected task.
+  function blockMediaPlayback(element) {
+    if (!element || element.__cxPlayBlocked) return;
+    try {
+      element.__cxOriginalPlay = element.play;
+      element.play = () => Promise.resolve();
+      element.__cxPlayBlocked = true;
+      element.pause();
+    } catch {
+      // Player properties may be locked.
+    }
+  }
+
+  function unblockMediaPlayback(element) {
+    if (!element?.__cxPlayBlocked) return;
+    try {
+      if (element.__cxOriginalPlay) element.play = element.__cxOriginalPlay;
+    } catch {
+      // Ignore a locked player.
+    }
+    delete element.__cxOriginalPlay;
+    element.__cxPlayBlocked = false;
+  }
+
+  function blockAllMediaPlayback() {
+    for (const media of document.querySelectorAll('video,audio')) blockMediaPlayback(media);
+  }
+
+  function unblockAllMediaPlayback() {
+    for (const media of document.querySelectorAll('video,audio')) unblockMediaPlayback(media);
+  }
+
   // A task point is still in progress when any of its media is playing. Never
   // jump to the next section while that is true, even if the card markers have
   // already flipped to "任务点已完成".
@@ -2694,13 +2731,17 @@
     // selected task: doing so paused the video we were watching, the site
     // resumed it, and the loop looked like "switching".
     const selectedMedia = new Set(mediaInsideFrame(selectedVideoTaskFrame));
+    for (const media of selectedMedia) unblockMediaPlayback(media);
     let paused = 0;
     for (const item of states) {
       if (item.frame === selectedVideoTaskFrame) continue;
       for (const media of mediaInsideFrame(item.frame)) {
         if (selectedMedia.has(media)) continue;
-        if (media.isConnected && !media.paused) {
-          try { media.pause(); paused += 1; } catch { /* Player lock. */ }
+        if (media.isConnected) {
+          try {
+            if (!media.paused) paused += 1;
+            blockMediaPlayback(media);
+          } catch { /* Player lock. */ }
         }
       }
     }
@@ -4029,6 +4070,7 @@
 
   start();
 })();
+
 
 
 
