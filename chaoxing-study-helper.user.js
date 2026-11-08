@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.21
+// @version      2.6.22
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -255,6 +255,8 @@
   let lastVerificationNoticeAt = 0;
   let lastAdoptAt = 0;
   let lastEnforceLogAt = 0;
+  let locallyCompletedTaskKeys = new Set();
+  let localCompletionPage = '';
   let automationGraceUntil = 0;
   let verifyCooldownUntil = 0;
   let selfFocusPauseTimes = [];
@@ -1072,13 +1074,33 @@
     }
   }
 
+  // Once a task's media has reached the end, keep it completed for this page
+  // even if the site later replaces the player iframe or its attachment state
+  // lags. Without this the finished first video looked pending again and stole
+  // the selection from the second video.
+  function syncLocalCompletionPage() {
+    const signature = `${location.pathname}|${location.search}|${currentChapterMarker()}`;
+    if (signature !== localCompletionPage) {
+      localCompletionPage = signature;
+      locallyCompletedTaskKeys.clear();
+    }
+  }
+
+  function markTaskCompleted(key) {
+    if (key) locallyCompletedTaskKeys.add(String(key));
+  }
+
   function getVideoTaskStates(doc = document) {
+    syncLocalCompletionPage();
     return videoTaskFrames(doc).map((frame, index) => {
+      const key = getFrameTaskKey(frame, index);
+      const finished = mediaFinishedInFrame(frame);
+      if (finished) markTaskCompleted(key);
       let state = readTaskStateFromFrameElement(frame);
-      if (mediaFinishedInFrame(frame)) {
+      if (finished || locallyCompletedTaskKeys.has(key)) {
         state = { known: true, completed: true, taskPoint: true, label: state.label || '' };
       }
-      return { frame, state, index, key: getFrameTaskKey(frame, index) };
+      return { frame, state, index, key };
     });
   }
 
@@ -2885,6 +2907,9 @@
         taskPlayPauses = [];
         taskPlaySuppressedUntil = 0;
       });
+      const boundKey = selectedVideoTaskKey;
+      if (element.ended) markTaskCompleted(boundKey);
+      element.addEventListener('ended', () => markTaskCompleted(boundKey), { once: true });
     } catch {
       // Player may replace the element.
     }
@@ -4112,6 +4137,7 @@
 
   start();
 })();
+
 
 
 
