@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习助手
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.6.18
+// @version      2.6.19
 // @description  超星学习通视频自动播放、复制粘贴限制解除、加密题目解码与 OpenAI 兼容 API 辅助答题，支持按任务点完成状态筛选多视频、自动提交、章节跳转和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
@@ -2705,6 +2705,25 @@
     element.__cxPlayBlocked = false;
   }
 
+  // Instance-level override alone can be bypassed by code that calls the
+  // prototype method (video.js does this on some builds). Guard the prototype
+  // once per page so every play() path observes the block flag.
+  function installPlayGuard() {
+    try {
+      const proto = pageWindow?.HTMLMediaElement?.prototype;
+      if (!proto || proto.__cxPlayGuardInstalled) return;
+      const original = proto.play;
+      if (typeof original !== 'function') return;
+      proto.play = function guardedPlay(...args) {
+        if (this && this.__cxPlayBlocked) return Promise.resolve();
+        return original.apply(this, args);
+      };
+      proto.__cxPlayGuardInstalled = true;
+    } catch {
+      // Some pages replace HTMLMediaElement or block unsafeWindow access.
+    }
+  }
+
   function blockAllMediaPlayback() {
     for (const media of document.querySelectorAll('video,audio')) blockMediaPlayback(media);
   }
@@ -3992,6 +4011,7 @@
       }
       verifyCooldownUntil = Number(gmGet(VERIFY_COOLDOWN_KEY, 0) || 0);
       automationGraceUntil = Date.now() + 3000;
+      installPlayGuard();
       installCopyUnlock();
       scanMedia();
       if (isTop) coordinateVideoTasks();
@@ -4070,6 +4090,7 @@
 
   start();
 })();
+
 
 
 
