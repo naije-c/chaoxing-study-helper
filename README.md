@@ -10,27 +10,28 @@ chaoxing-study-helper.user.js
 
 使用 Tampermonkey 打开以下地址安装：
 
-[安装超星学习助手](https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js)
+[安装超星学习助手](https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/restart-from-2.4.5/chaoxing-study-helper.user.js)
 
 ## 自动更新
 
 脚本已经从 GitHub Raw 地址检查更新：
 
 ```text
-https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js
+https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/restart-from-2.4.5/chaoxing-study-helper.user.js
 ```
 
 以后更新时只需要：
 
 1. 修改 `chaoxing-study-helper.user.js`。
 2. 提升脚本头部的 `@version`。
-3. 提交并推送到 `main` 分支。
+3. 提交并推送到 `restart-from-2.4.5` 分支。
 4. Tampermonkey 会定期检查并自动更新。
 
 ## 功能
 
 ### 视频功能
 
+- 自动识别已完成视频任务点，多视频章节只播放未完成任务点
 - 自动播放视频、音频
 - 暂停后自动恢复
 - 静音播放

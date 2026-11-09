@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         超星学习助手 · 完整版
 // @namespace    https://github.com/naije-c/chaoxing-study-helper
-// @version      2.4.5
-// @description  超星学习通视频自动播放、加密题目解码与 OpenAI 兼容 API 辅助答题，支持同页及跨 iframe 多视频锁定、防重复请求、跨 iframe 自动确认提交、视频完成后打开章节测验、测验完成后下一节、接口测试和模型列表。
+// @version      2.4.6
+// @description  超星学习通视频自动播放、加密题目解码与 OpenAI 兼容 API 辅助答题，支持识别已完成任务点、仅播放未完成视频、同页及跨 iframe 多视频锁定、自动提交、章节跳转、接口测试和模型列表。
 // @author       naije-c; OCS contributors (font decoding algorithm, MIT)
 // @license      MIT
 // @homepageURL  https://github.com/naije-c/chaoxing-study-helper
 // @supportURL   https://github.com/naije-c/chaoxing-study-helper/issues
 // @source       https://github.com/naije-c/chaoxing-study-helper
-// @updateURL    https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js
-// @downloadURL  https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/main/chaoxing-study-helper.user.js
+// @updateURL    https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/restart-from-2.4.5/chaoxing-study-helper.user.js
+// @downloadURL  https://raw.githubusercontent.com/naije-c/chaoxing-study-helper/restart-from-2.4.5/chaoxing-study-helper.user.js
 // @match        *://*.chaoxing.com/*
 // @match        *://mooc1.chaoxing.com/*
 // @match        *://mooc1-1.chaoxing.com/*
@@ -38,6 +38,7 @@
 // @match        *://*.smjyxy.cn/*
 // @match        *://*.sslibrary.com/*
 // @match        *://*.xuexi365.com/*
+// @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
@@ -93,6 +94,7 @@
   const gmSet = typeof GM_setValue === 'function'
     ? GM_setValue
     : () => {};
+  const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   function normalizeSettings(raw) {
     const value = raw && typeof raw === 'object' ? raw : {};
@@ -202,6 +204,15 @@
   let mediaOwnerId = '';
   let activeMediaOwnerId = '';
   let activeMediaOwnerAt = 0;
+  let currentTaskStatusCache = null;
+  let currentTaskStatusCheckedAt = 0;
+  let multiVideoMode = false;
+  let taskFocusGranted = false;
+  let selectedVideoTaskFrame = null;
+  let selectedVideoTaskKey = '';
+  let multiVideoAdvanceSignature = '';
+  let localCompletionPage = '';
+  const locallyCompletedTaskKeys = new Set();
   const seenCommands = new Set();
 
   const isTop = (() => {
@@ -248,17 +259,370 @@
 
   const MEDIA_FRAME_ID = makeId();
 
+
+  // OCSJS reads Chaoxing attachments: job=true means unfinished, isPassed=true means finished.
+  // Visible completion markers and ended media are also used because attachments can lag behind the page.
+  const TASK_COMPLETED_SELECTOR = '.icon_Completed, .task-point-completed, .taskPointCompleted, [data-completed="true"], [data-task-completed="true"]';
+  const TASK_UNCOMPLETED_SELECTOR = '.icon_Uncompleted, .icon_UnComplete, .icon_Unfinished, .task-point-uncompleted, .taskPointUncompleted, .taskPointUncomplete, [data-completed="false"], [data-task-completed="false"]';
+  const TASK_COMPLETED_TEXT = /任务点已完成|任务点.{0,20}已完成|已完成任务点/;
+  const TASK_UNCOMPLETED_TEXT = /任务点未完成|任务点待完成|待完成任务点|未完成任务点|任务点.{0,20}未完成/;
+
+  function safeWindowProperty(win, key) {
+    try { return win?.[key]; } catch { return undefined; }
+  }
+
+  function frameIsInsideAnotherFrame(frame) {
+    try {
+      if (frame.parentElement?.tagName === 'IFRAME') return true;
+      if (frame.parentElement?.tagName !== 'BODY') return false;
+      return Boolean(frame.ownerDocument?.defaultView?.frameElement);
+    } catch { return false; }
+  }
+
+  function hostFrameElementOf(doc) {
+    try { return doc?.defaultView?.frameElement || null; } catch { return null; }
+  }
+
+  function parseFrameData(frame) {
+    if (!frame) return {};
+    const walkAncestors = !frameIsInsideAnotherFrame(frame);
+    let node = frame;
+    for (let depth = 0; node && depth < 10; depth++) {
+      try {
+        if (node.tagName === 'IFRAME') {
+          const raw = node.getAttribute('data');
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw);
+              if (parsed && typeof parsed === 'object') return parsed;
+            } catch { /* Continue with explicit attributes and URL. */ }
+          }
+          const directJobId = node.getAttribute('data-jobid') || node.getAttribute('data-job-id');
+          if (directJobId) return { jobid: directJobId };
+          const params = new URL(node.getAttribute('src') || node.src || '', location.href).searchParams;
+          const urlJobId = params.get('jobid') || params.get('jobId') || params.get('_jobid');
+          if (urlJobId) return { jobid: urlJobId };
+        }
+      } catch { /* Ignore malformed frame data. */ }
+      if (!walkAncestors) break;
+      const parent = node.parentElement;
+      if (parent && parent !== node.ownerDocument?.body && parent !== node.ownerDocument?.documentElement) {
+        node = parent;
+        continue;
+      }
+      node = node.ownerDocument ? hostFrameElementOf(node.ownerDocument) : null;
+    }
+    return {};
+  }
+
+  function isTruthyFlag(value) {
+    return value === true || value === 1 || value === '1' || value === 'true';
+  }
+
+  function attachmentListsFor(frame) {
+    const candidates = [pageWindow, window, frame?.ownerDocument?.defaultView, frame?.contentWindow, safeWindowProperty(window, 'parent'), safeWindowProperty(window, 'top')];
+    const lists = [];
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      const value = safeWindowProperty(candidate, 'attachments');
+      if (Array.isArray(value) && !lists.includes(value)) lists.push(value);
+    }
+    return lists;
+  }
+
+  function readAttachmentTaskState(frame) {
+    if (!frame) return null;
+    const data = parseFrameData(frame);
+    const targetId = data.jobid || data._jobid;
+    if (!targetId) return null;
+    for (const attachments of attachmentListsFor(frame)) {
+      const attachment = attachments.find((item) => {
+        const attachmentId = item?.jobid || item?.property?._jobid || item?.property?.jobid;
+        return attachmentId && String(attachmentId) === String(targetId);
+      });
+      if (!attachment) continue;
+      const label = String(attachment.name || attachment.title || attachment.property?.name || attachment.property?.title || '').trim();
+      const job = isTruthyFlag(attachment.job);
+      const passed = isTruthyFlag(attachment.isPassed);
+      if (passed) return { known: true, completed: true, taskPoint: true, label };
+      if (job) return { known: true, completed: false, taskPoint: true, label };
+      return { known: true, completed: true, taskPoint: false, label };
+    }
+    return null;
+  }
+
+  function readableTaskText(node) {
+    if (!node) return '';
+    let text = '';
+    try {
+      for (const child of node.childNodes) {
+        if (child.nodeType === 3) { text += child.textContent || ''; continue; }
+        if (child.nodeType !== 1) continue;
+        if (['IFRAME','VIDEO','AUDIO','SCRIPT','STYLE','NOSCRIPT'].includes(child.tagName)) continue;
+        text += readableTaskText(child);
+        if (text.length > 800) break;
+      }
+    } catch { /* Detached nodes are skipped. */ }
+    return text.replace(/\s+/g, '');
+  }
+
+  function selectorInDocument(root, selector) {
+    try {
+      return Array.from(root.querySelectorAll(selector)).some((element) => element.ownerDocument === root.ownerDocument);
+    } catch { return false; }
+  }
+
+  function ownVideoModule(frame) {
+    return /\/ananas\/modules\/video|modules\/video\/index\.html/i.test(String(frame?.getAttribute?.('src') || frame?.src || ''));
+  }
+
+  function isPlayerNestedInTaskFrame(frame) {
+    try {
+      let doc = frame?.ownerDocument;
+      for (let depth = 0; doc && depth < 6; depth++) {
+        const host = doc.defaultView?.frameElement;
+        if (!host) return false;
+        if (ownVideoModule(host)) return true;
+        doc = host.ownerDocument;
+      }
+    } catch { return false; }
+    return false;
+  }
+
+  function isTaskCandidateFrame(frame) {
+    if (!frame) return false;
+    try {
+      const src = String(frame.getAttribute('src') || frame.src || '');
+      if (!src || src === 'about:blank') return false;
+      if (ownVideoModule(frame)) return true;
+      const data = parseFrameData(frame);
+      if (data.jobid || data._jobid) return true;
+      if (!/video/i.test(src) || frameIsInsideAnotherFrame(frame)) return false;
+      return Boolean(frame.getBoundingClientRect().height);
+    } catch { return false; }
+  }
+
+  function outerTaskContainer(frame) {
+    let node = frame?.parentElement;
+    for (let depth = 0; node && depth < 14; depth++, node = node.parentElement) {
+      try {
+        if (node === frame.ownerDocument?.body || node === frame.ownerDocument?.documentElement) return null;
+        const text = readableTaskText(node);
+        if (selectorInDocument(node, TASK_COMPLETED_SELECTOR) || selectorInDocument(node, TASK_UNCOMPLETED_SELECTOR) || /任务点|已完成|未完成|待完成/.test(text)) return node;
+      } catch { return null; }
+    }
+    return null;
+  }
+
+  function taskContainerWithOtherVideoFrames(frame) {
+    let node = outerTaskContainer(frame);
+    for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+      try {
+        if (node === frame.ownerDocument?.body || node === frame.ownerDocument?.documentElement) return null;
+        const others = Array.from(node.querySelectorAll('iframe')).filter((candidate) => candidate !== frame && isTaskCandidateFrame(candidate)).length;
+        if (others > 0) return node;
+      } catch { return null; }
+    }
+    return null;
+  }
+
+  function taskStateFromContainer(container) {
+    if (!container) return null;
+    const text = readableTaskText(container);
+    if (selectorInDocument(container, TASK_COMPLETED_SELECTOR) || TASK_COMPLETED_TEXT.test(text)) return { known: true, completed: true, taskPoint: true, label: '' };
+    if (selectorInDocument(container, TASK_UNCOMPLETED_SELECTOR) || TASK_UNCOMPLETED_TEXT.test(text)) return { known: true, completed: false, taskPoint: true, label: '' };
+    return null;
+  }
+
+  function completedMarkerNear(frame) {
+    let node = frame?.parentElement;
+    for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+      try {
+        if (node === frame.ownerDocument?.body || node === frame.ownerDocument?.documentElement) return null;
+        const others = Array.from(node.querySelectorAll('iframe')).filter((candidate) => candidate !== frame && isTaskCandidateFrame(candidate)).length;
+        if (others > 0) return null;
+        const marker = Array.from(node.querySelectorAll(TASK_COMPLETED_SELECTOR)).find((element) => element.ownerDocument === node.ownerDocument && isVisible(element));
+        if (marker || TASK_COMPLETED_TEXT.test(readableTaskText(node))) return { known: true, completed: true, taskPoint: true, label: '' };
+      } catch { return null; }
+    }
+    return null;
+  }
+
+  function videoTaskFrames(doc = document) {
+    const result = [];
+    const seenDocs = new Set();
+    const walk = (root, depth = 0) => {
+      if (!root || seenDocs.has(root) || depth > 7) return;
+      seenDocs.add(root);
+      for (const frame of Array.from(root.querySelectorAll('iframe'))) {
+        let innerDoc = null;
+        try { innerDoc = frame.contentDocument || null; } catch { innerDoc = null; }
+        const nested = Boolean(innerDoc && Array.from(innerDoc.querySelectorAll('iframe')).some(ownVideoModule));
+        const directMedia = Boolean(innerDoc?.querySelector('video,audio'));
+        if (!isPlayerNestedInTaskFrame(frame) && (isTaskCandidateFrame(frame) || (directMedia && !nested))) result.push(frame);
+        if (innerDoc) walk(innerDoc, depth + 1);
+      }
+    };
+    walk(doc);
+    return result;
+  }
+
+  function mediaInDocument(doc, depth = 0) {
+    if (!doc || depth > 5) return null;
+    const direct = doc.querySelector?.('video,audio');
+    if (direct) return direct;
+    try {
+      for (const frame of Array.from(doc.querySelectorAll('iframe'))) {
+        const nested = frame.contentDocument ? mediaInDocument(frame.contentDocument, depth + 1) : null;
+        if (nested) return nested;
+      }
+    } catch { /* Cross-origin child frame. */ }
+    return null;
+  }
+
+  function mediaFinishedInFrame(frame) {
+    if (!frame) return false;
+    try {
+      const media = mediaInDocument(frame.contentDocument);
+      if (!media) return false;
+      if (media.ended) return true;
+      const duration = Number(media.duration);
+      const current = Number(media.currentTime);
+      return Number.isFinite(duration) && duration > 0 && Number.isFinite(current) && current / duration >= 0.995;
+    } catch { return false; }
+  }
+
+  function readTaskStateFromFrameElement(frame) {
+    if (!frame) return { known: false, completed: false, taskPoint: false };
+    const attachmentState = readAttachmentTaskState(frame);
+    const ownContainer = outerTaskContainer(frame);
+    const own = taskStateFromContainer(ownContainer);
+    const sharedContainer = taskContainerWithOtherVideoFrames(frame);
+    const shared = sharedContainer ? taskStateFromContainer(sharedContainer) : null;
+    const marker = completedMarkerNear(frame);
+    const finished = mediaFinishedInFrame(frame);
+    const label = attachmentState?.label || own?.label || '';
+    if (finished || own?.completed || shared?.completed || marker?.completed || attachmentState?.completed) return { known: true, completed: true, taskPoint: true, label };
+    if (attachmentState) return { ...attachmentState, label };
+    if (own) return own;
+    if (shared) return shared;
+    if (ownContainer && /任务点/.test(readableTaskText(ownContainer))) return { known: true, completed: false, taskPoint: true, label: '' };
+    return { known: false, completed: false, taskPoint: false };
+  }
+
+  function getCurrentTaskStatus(force = false) {
+    const now = Date.now();
+    if (!force && currentTaskStatusCache && now - currentTaskStatusCheckedAt < 1500) return currentTaskStatusCache;
+    let state = { known: false, completed: false, taskPoint: false };
+    try { state = readTaskStateFromFrameElement(getOwnTaskFrame()); } catch { /* Cross-origin parent frame. */ }
+    currentTaskStatusCache = state;
+    currentTaskStatusCheckedAt = now;
+    return state;
+  }
+
+  function shouldSkipCompletedVideoTask() {
+    if (!settings.running) return false;
+    const state = getCurrentTaskStatus();
+    return state.known && state.completed;
+  }
+
+  function getFrameTaskKey(frame, index = 0) {
+    const data = parseFrameData(frame);
+    const targetId = data.jobid || data._jobid;
+    return targetId ? `job:${targetId}` : `frame:${index}`;
+  }
+
+  function getOwnTaskFrame() {
+    try {
+      let frame = window.frameElement;
+      for (let depth = 0; frame && depth < 8; depth++) {
+        if (!isPlayerNestedInTaskFrame(frame) && isTaskCandidateFrame(frame)) return frame;
+        const ownerDoc = frame.ownerDocument;
+        frame = ownerDoc?.defaultView?.frameElement || null;
+      }
+      return window.frameElement;
+    } catch { return null; }
+  }
+
+  function getOwnTaskKey() {
+    try {
+      const frame = getOwnTaskFrame();
+      const data = parseFrameData(frame);
+      const targetId = data.jobid || data._jobid;
+      if (targetId) return `job:${targetId}`;
+      const index = videoTaskFrames(frame?.ownerDocument).indexOf(frame);
+      return `frame:${Math.max(0, index)}`;
+    } catch { return ''; }
+  }
+
+  function syncLocalCompletionPage() {
+    const signature = `${location.pathname}|${location.search}`;
+    if (signature !== localCompletionPage) {
+      localCompletionPage = signature;
+      locallyCompletedTaskKeys.clear();
+    }
+  }
+
+  function markTaskCompleted(key) {
+    const value = String(key || '');
+    if (value) locallyCompletedTaskKeys.add(value);
+  }
+
+  function getVideoTaskStates(doc = document) {
+    syncLocalCompletionPage();
+    return videoTaskFrames(doc).map((frame, index) => {
+      const key = getFrameTaskKey(frame, index);
+      const finished = mediaFinishedInFrame(frame);
+      if (finished) markTaskCompleted(key);
+      let state = readTaskStateFromFrameElement(frame);
+      if (finished || locallyCompletedTaskKeys.has(key)) state = { known: true, completed: true, taskPoint: true, label: state.label || '' };
+      return { frame, state, index, key };
+    });
+  }
+
+  function isMultiVideoTaskPage() {
+    return isTop && videoTaskFrames(document).length > 1;
+  }
+
+  function hasMultipleVideoTaskFrames() {
+    if (isTop) return videoTaskFrames(document).length > 1;
+    try {
+      const ownerDoc = window.frameElement?.ownerDocument;
+      if (ownerDoc) return videoTaskFrames(ownerDoc).length > 1;
+    } catch { /* Cross-origin parent. */ }
+    return multiVideoMode;
+  }
+
+  function videoPlaybackNeedsFocus() {
+    if (isTop) return false;
+    return settings.running && (multiVideoMode || hasMultipleVideoTaskFrames()) && !taskFocusGranted;
+  }
+
+  function scrollCurrentVideoTaskIntoView() {
+    try { window.frameElement?.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch { /* Frame is navigating. */ }
+  }
+
   function requestMediaOwnership() {
+    if (shouldSkipCompletedVideoTask() || videoPlaybackNeedsFocus()) {
+      if (currentMedia && !currentMedia.paused) {
+        try { currentMedia.pause(); } catch { /* The player may own this element. */ }
+      }
+      releaseMediaOwnership();
+      return;
+    }
+    const taskState = getCurrentTaskStatus();
     const message = {
       kind: MESSAGE_KIND,
       id: makeId(),
       action: 'media-claim',
       frameId: MEDIA_FRAME_ID,
+      taskKey: getOwnTaskKey(),
+      taskCompleted: Boolean(taskState.known && taskState.completed),
       origin: location.origin,
       url: location.href
     };
     if (isTop) {
-      handleMediaClaimMessage(message);
+      handleMediaClaimMessage(message, window);
       return;
     }
     try {
@@ -268,8 +632,39 @@
     }
   }
 
-  function handleMediaClaimMessage(data) {
-    if (!isTop || !data?.frameId) return;
+  function windowIsWithin(sourceWindow, ancestorWindow) {
+    let current = sourceWindow;
+    for (let depth = 0; current && depth < 8; depth++) {
+      if (current === ancestorWindow) return true;
+      if (current.parent === current) break;
+      current = current.parent;
+    }
+    return false;
+  }
+
+  function findVideoFrameByWindow(sourceWindow) {
+    if (!sourceWindow) return null;
+    for (const frame of videoTaskFrames(document)) {
+      try {
+        if (windowIsWithin(sourceWindow, frame.contentWindow)) return frame;
+      } catch { /* The frame is being replaced. */ }
+    }
+    return null;
+  }
+
+  function handleMediaClaimMessage(data, sourceWindow) {
+    if (!isTop || !data?.frameId || data.taskCompleted === true) return;
+    const sourceFrame = findVideoFrameByWindow(sourceWindow);
+    if (isMultiVideoTaskPage()) {
+      if (!selectedVideoTaskFrame) return;
+      if (sourceFrame && sourceFrame !== selectedVideoTaskFrame) return;
+      if (!sourceFrame && selectedVideoTaskKey && data.taskKey !== selectedVideoTaskKey) return;
+    }
+    if (sourceFrame) {
+      const sourceState = readTaskStateFromFrameElement(sourceFrame);
+      if (sourceState.known && sourceState.completed) return;
+      if (isMultiVideoTaskPage() && !sourceState.known) return;
+    }
     const frameId = String(data.frameId);
     const now = Date.now();
     if (!activeMediaOwnerId || activeMediaOwnerId === frameId || now - activeMediaOwnerAt > 10000) {
@@ -290,6 +685,7 @@
     mediaOwnerId = ownerId || '';
     if (!mediaOwnerId) return;
     if (mediaOwnerId === MEDIA_FRAME_ID) {
+      scrollCurrentVideoTaskIntoView();
       pauseOtherMedia(currentMedia);
       if (currentMedia && settings.running) tryPlay(true);
       return;
@@ -324,6 +720,10 @@
 
   function maintainMediaOwnership() {
     if (!settings.running) return;
+    if (shouldSkipCompletedVideoTask() || videoPlaybackNeedsFocus()) {
+      releaseMediaOwnership();
+      return;
+    }
     if (isTop) {
       if (activeMediaOwnerId && Date.now() - activeMediaOwnerAt > 10000) {
         activeMediaOwnerId = '';
@@ -383,6 +783,7 @@
       clearTimeout(nextTimer);
       retryTimer = 0;
       nextTimer = 0;
+      taskFocusGranted = false;
       try {
         currentMedia.pause();
       } catch {
@@ -508,6 +909,11 @@
   function tryPlay(forceOwned = false) {
     if (!settings.running || !currentMedia || !currentMedia.isConnected) return;
     if (currentMedia.ended) return;
+    if (shouldSkipCompletedVideoTask() || videoPlaybackNeedsFocus()) {
+      try { currentMedia.pause(); } catch { /* The player may own this element. */ }
+      releaseMediaOwnership();
+      return;
+    }
 
     if (!forceOwned && mediaOwnerId !== MEDIA_FRAME_ID) {
       if (!mediaOwnerId) requestMediaOwnership();
@@ -575,6 +981,15 @@
     const { signal } = mediaAbort;
 
     media.addEventListener('play', () => {
+      if (settings.running && shouldSkipCompletedVideoTask()) {
+        try { media.pause(); } catch { /* The player may own this element. */ }
+        releaseMediaOwnership();
+        return;
+      }
+      if (settings.running && videoPlaybackNeedsFocus()) {
+        try { media.pause(); } catch { /* The player may own this element. */ }
+        return;
+      }
       if (settings.running && mediaOwnerId !== MEDIA_FRAME_ID) requestMediaOwnership();
       applyMediaSettings();
       reportStatus('playing');
@@ -613,6 +1028,14 @@
   }
 
   function scanMedia() {
+    if (settings.running && shouldSkipCompletedVideoTask()) {
+      if (currentMedia && !currentMedia.paused) {
+        try { currentMedia.pause(); } catch { /* The player may own this element. */ }
+      }
+      releaseMediaOwnership();
+      return;
+    }
+    if (videoPlaybackNeedsFocus()) return;
     if (currentMedia && currentMedia.isConnected) {
       const activeVisible = isVisible(currentMedia);
       const alternatives = Array.from(document.querySelectorAll('video,audio'))
@@ -749,7 +1172,34 @@
     if (!data || data.kind !== MESSAGE_KIND || !data.action) return;
 
     if (data.action === 'media-claim') {
-      if (isTop) handleMediaClaimMessage(data);
+      if (isTop) handleMediaClaimMessage(data, event.source);
+      return;
+    }
+    if (data.action === 'multi-video-mode') {
+      if (!isTop) {
+        multiVideoMode = Boolean(data.active);
+        if (data.resetFocus) taskFocusGranted = false;
+        if (!multiVideoMode || !taskFocusGranted) {
+          if (currentMedia && !currentMedia.paused) {
+            try { currentMedia.pause(); } catch { /* The player may own this element. */ }
+          }
+          releaseMediaOwnership();
+        }
+        sendToChildren(data);
+      }
+      return;
+    }
+    if (data.action === 'task-focus') {
+      if (!isTop) {
+        multiVideoMode = true;
+        taskFocusGranted = true;
+        currentTaskStatusCheckedAt = 0;
+        sendToChildren(data);
+        window.setTimeout(() => {
+          scanMedia();
+          tryPlay();
+        }, 0);
+      }
       return;
     }
     if (data.action === 'media-release') {
@@ -1727,60 +2177,165 @@
     return /章节测验/.test(title) ? tab : null;
   }
 
+
+  function continueAfterVideoTasks() {
+    if (!settings.running || !settings.autoNext) return;
+    const testTab = findChapterTestTab();
+    if (testTab && testTab.classList.contains('active')) return;
+    if (testTab) {
+      testTab.click();
+      reportStatus('quiz-tab-opened', { message: '视频已完成，已打开章节测验。' });
+      return;
+    }
+    const clicked = clickNextButton();
+    if (clicked) reportStatus('next', { message: '视频已完成，已进入下一节。' });
+    else reportStatus('no-next', { message: '视频已完成，但没有找到章节测验或下一节入口，请手动切换。' });
+  }
+
+  function postMessageToVideoFrame(frame, message) {
+    try { frame?.contentWindow?.postMessage(message, '*'); } catch { /* Frame is navigating. */ }
+  }
+
+  function videoTaskLabel(item) {
+    return item?.state?.label || `第 ${Number(item?.index || 0) + 1} 个视频任务点`;
+  }
+
+  function resetVideoTaskFocus() {
+    selectedVideoTaskFrame = null;
+    selectedVideoTaskKey = '';
+    if (!isTop) return;
+    sendToChildren({ kind: MESSAGE_KIND, id: makeId(), action: 'multi-video-mode', active: false, resetFocus: true });
+  }
+
+  function focusVideoTask(item) {
+    if (!isTop || !item?.frame?.isConnected) return false;
+    if (selectedVideoTaskFrame === item.frame && selectedVideoTaskKey === item.key) return true;
+    selectedVideoTaskFrame = item.frame;
+    selectedVideoTaskKey = item.key;
+    multiVideoAdvanceSignature = '';
+    sendToChildren({ kind: MESSAGE_KIND, id: makeId(), action: 'multi-video-mode', active: true, resetFocus: true });
+    postMessageToVideoFrame(item.frame, { kind: MESSAGE_KIND, id: makeId(), action: 'task-focus', taskKey: item.key });
+    reportStatus('video-task-selected', { message: `已选择未完成任务：${videoTaskLabel(item)}，正在等待视频开始…` });
+    return true;
+  }
+
+  function scheduleMultiVideoAdvance(states) {
+    if (!settings.autoNext || videoAutoActionTimer) return;
+    const signature = `${location.pathname}|${location.search}|${states.map((item) => `${item.key}:${item.state.completed}`).join('|')}`;
+    if (signature === multiVideoAdvanceSignature) return;
+    multiVideoAdvanceSignature = signature;
+    const delay = Math.max(1, Number(settings.nextDelay) || 3);
+    reportStatus('video-complete', { message: `本页视频任务点均已完成，${delay} 秒后检查章节测验或下一节…` });
+    videoAutoActionTimer = window.setTimeout(() => {
+      videoAutoActionTimer = 0;
+      probeMultiVideoTasks(0);
+    }, delay * 1000);
+  }
+
+  function coordinateVideoTasks() {
+    if (!isTop) return;
+    if (!settings.running) {
+      if (selectedVideoTaskFrame) resetVideoTaskFocus();
+      return;
+    }
+    if (!isMultiVideoTaskPage()) {
+      if (selectedVideoTaskFrame) resetVideoTaskFocus();
+      return;
+    }
+    if (videoAutoActionTimer) return;
+    const states = getVideoTaskStates(document);
+    const pending = states.filter((item) => item.state.known && !item.state.completed);
+    const selectedPending = pending.find((item) => item.frame === selectedVideoTaskFrame && item.key === selectedVideoTaskKey);
+    if (selectedPending) {
+      postMessageToVideoFrame(selectedPending.frame, { kind: MESSAGE_KIND, id: makeId(), action: 'task-focus', taskKey: selectedPending.key });
+      return;
+    }
+    if (pending.length > 0) {
+      focusVideoTask(pending[0]);
+      return;
+    }
+    const unknown = states.filter((item) => !item.state.known);
+    if (unknown.length > 0) {
+      if (selectedVideoTaskFrame) resetVideoTaskFocus();
+      reportStatus('video-task-waiting', { message: `还有 ${unknown.length} 个视频任务点暂时无法判断是否完成，暂不自动播放，避免重播已完成视频。` });
+      return;
+    }
+    resetVideoTaskFocus();
+    scheduleMultiVideoAdvance(states);
+  }
+
+  function probeMultiVideoTasks(attempt = 0) {
+    videoAutoActionTimer = 0;
+    if (!settings.running) return;
+    const states = getVideoTaskStates(document);
+    const pending = states.filter((item) => item.state.known && !item.state.completed);
+    if (pending.length > 0) {
+      focusVideoTask(pending[0]);
+      return;
+    }
+    const unknown = states.filter((item) => !item.state.known);
+    if (unknown.length > 0 && attempt < 3) {
+      reportStatus('video-complete', { message: '正在确认剩余视频任务点的完成状态…' });
+      videoAutoActionTimer = window.setTimeout(() => probeMultiVideoTasks(attempt + 1), 1500);
+      return;
+    }
+    if (unknown.length > 0) {
+      reportStatus('no-next', { message: '仍有视频任务点无法判断完成状态，请手动检查任务列表。' });
+      return;
+    }
+    if (!settings.autoNext) {
+      reportStatus('video-complete', { message: '本页视频任务点均已完成。' });
+      return;
+    }
+    continueAfterVideoTasks();
+  }
+
+
   function handleVideoCompletion(payload) {
     if (!isTop || !payload) return;
-    if (!settings.running || !settings.autoNext) {
+    if (payload.taskKey) markTaskCompleted(payload.taskKey);
+    if (!settings.running) {
       lastVideoAutoActionSignature = '';
       return;
     }
     if (!payload.signature || payload.signature === lastVideoAutoActionSignature || videoAutoActionTimer) return;
-
-    const testTab = findChapterTestTab();
-    if (testTab && testTab.classList.contains('active')) {
-      lastVideoAutoActionSignature = payload.signature;
-      return;
-    }
-
     lastVideoAutoActionSignature = payload.signature;
     const delay = Math.max(1, Number(settings.nextDelay) || 3);
-    if (testTab) {
-      reportStatus('video-complete', { message: `视频已完成，${delay} 秒后打开章节测验…` });
-    } else {
-      reportStatus('ended', { message: `视频已完成，${delay} 秒后进入下一节…`, autoNext: true });
+    if (isMultiVideoTaskPage()) {
+      reportStatus('video-complete', { message: `当前视频已完成，${delay} 秒后选择下一个未完成任务点…` });
+      videoAutoActionTimer = window.setTimeout(() => {
+        videoAutoActionTimer = 0;
+        probeMultiVideoTasks(0);
+      }, delay * 1000);
+      return;
     }
-
+    if (!settings.autoNext) return;
+    const testTab = findChapterTestTab();
+    if (testTab && testTab.classList.contains('active')) return;
+    if (testTab) reportStatus('video-complete', { message: `视频已完成，${delay} 秒后打开章节测验…` });
+    else reportStatus('ended', { message: `视频已完成，${delay} 秒后进入下一节…`, autoNext: true });
     videoAutoActionTimer = window.setTimeout(() => {
       videoAutoActionTimer = 0;
-      if (!settings.running || !settings.autoNext) return;
-      const currentTestTab = findChapterTestTab();
-      if (currentTestTab) {
-        if (currentTestTab.classList.contains('active')) return;
-        currentTestTab.click();
-        reportStatus('quiz-tab-opened', { message: '视频已完成，已打开章节测验。' });
-        return;
-      }
-      const clicked = clickNextButton();
-      if (clicked) {
-        reportStatus('next', { message: '视频已完成，已进入下一节。' });
-      } else {
-        reportStatus('no-next', { message: '视频已完成，但没有找到章节测验或下一节入口，请手动切换。' });
-      }
+      continueAfterVideoTasks();
     }, delay * 1000);
   }
 
   function scanVideoCompletion() {
-    if (!settings.running || !settings.autoNext) {
+    if (!settings.running) {
       lastVideoCompletionSignature = '';
       return;
     }
     if (!currentMedia || !isMediaComplete(currentMedia)) return;
-    const signature = `${location.pathname}|${location.search}|${currentMedia.currentSrc || ''}`;
+    const taskKey = getOwnTaskKey();
+    markTaskCompleted(taskKey);
+    const signature = `${location.pathname}|${location.search}|${taskKey}|${currentMedia.currentSrc || ''}`;
     if (signature === lastVideoCompletionSignature) return;
     lastVideoCompletionSignature = signature;
     const payload = {
       kind: MESSAGE_KIND,
       id: makeId(),
       action: 'video-complete',
+      taskKey,
       origin: location.origin,
       url: location.href,
       signature
@@ -2374,6 +2929,8 @@
       'no-next': payload.message || '视频已结束，但没有找到下一节按钮，请手动切换。',
       'quiz-complete': payload.message || '章节测验已完成，准备进入下一节…',
       'video-complete': payload.message || '视频已完成，准备打开章节测验…',
+      'video-task-selected': payload.message || '已选择未完成视频任务点。',
+      'video-task-waiting': payload.message || '正在确认视频任务点的完成状态…',
       'quiz-tab-opened': payload.message || '已打开章节测验，请等待答题。',
       blocked: payload.message || '浏览器阻止了自动播放，请点一下视频。',
       manual: payload.message || '需要手动处理当前页面。',
@@ -2432,12 +2989,14 @@
     const boot = () => {
       if (!isSupportedSite()) return;
       scanMedia();
+      if (isTop) coordinateVideoTasks();
       ensurePanel();
 
       scanTimer = window.setInterval(() => {
         refreshSettingsFromStorage();
         maintainMediaOwnership();
         scanMedia();
+        if (isTop) coordinateVideoTasks();
         ensurePanel();
         if (isTop) {
           broadcastAction('manual-check');
